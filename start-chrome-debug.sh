@@ -177,17 +177,17 @@ if curl -s http://127.0.0.1:9222/json/version > /dev/null 2>&1; then
   echo "正在打开各 Web 平台登录页（便于授权）..."
 
   WEB_URLS=(
-    "https://claude.ai/new"
-    "https://chatgpt.com"
-    "https://www.doubao.com/chat/"
-    "https://chat.qwen.ai"
-    "https://www.kimi.com"
     "https://gemini.google.com/app"
-    "https://grok.com"
     "https://chat.deepseek.com/"
-    "https://chatglm.cn"
-    "https://chat.z.ai/"
-    "https://manus.im/app"
+    "https://chatgpt.com"
+    "https://www.kimi.com"
+    # "https://claude.ai/new"
+    # "https://www.doubao.com/chat/"
+    # "https://chat.qwen.ai"
+    # "https://grok.com"
+    # "https://chatglm.cn"
+    # "https://chat.z.ai/"
+    # "https://manus.im/app"
   )
   for url in "${WEB_URLS[@]}"; do
     "$CHROME_PATH" --remote-debugging-port=9222 --user-data-dir="$USER_DATA_DIR" "$url" > /dev/null 2>&1 &
