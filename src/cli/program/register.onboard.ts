@@ -1,5 +1,4 @@
 import type { Command } from "commander";
-import { runOnboardWebAuth } from "../../commands/onboard-web-auth.js";
 import { formatAuthChoiceChoicesForCli } from "../../commands/auth-choice-options.js";
 import type { GatewayDaemonRuntime } from "../../commands/daemon-runtime.js";
 import { CORE_ONBOARD_AUTH_FLAGS } from "../../commands/onboard-core-auth-flags.js";
@@ -12,6 +11,7 @@ import type {
   SecretInputMode,
   TailscaleMode,
 } from "../../commands/onboard-types.js";
+import { runOnboardWebAuth } from "../../commands/onboard-web-auth.js";
 import { setupWizardCommand } from "../../commands/onboard.js";
 import { resolveManifestProviderOnboardAuthFlags } from "../../plugins/provider-auth-choices.js";
 import { defaultRuntime } from "../../runtime.js";
@@ -110,7 +110,15 @@ export function registerOnboardCommand(program: Command) {
     .command("webauth")
     .description("Web 模型授权向导 - 授权 Claude/ChatGPT/DeepSeek 等无需 API Key 的 Web 模型")
     .action(async () => {
-      await runOnboardWebAuth();
+      // Playwright / CDP / timers keep the Node event loop alive after auth;
+      // explicit exit so shell scripts (e.g. vclaw-zero.sh) continue to gateway start.
+      try {
+        await runOnboardWebAuth();
+        process.exit(0);
+      } catch (err) {
+        console.error(err);
+        process.exit(1);
+      }
     });
 
   command

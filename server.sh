@@ -1,6 +1,6 @@
 #!/bin/bash
-# OpenClaw Gateway 服务启动脚本
-# 兼容 macOS / Linux (含 Deepin) / Windows (Git Bash / WSL)
+# Script khởi chạy dịch vụ OpenClaw Gateway
+# Tương thích macOS / Linux (bao gồm Deepin) / Windows (Git Bash / WSL)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 STATE_DIR="$SCRIPT_DIR/.openclaw-upstream-state"
@@ -8,10 +8,10 @@ CONFIG_FILE="$STATE_DIR/openclaw.json"
 PID_FILE="$SCRIPT_DIR/.gateway.pid"
 PORT=3001
 
-# 日志文件名（区分不同实例）
+# Tiền tố tên file log (để phân biệt các instance khác nhau)
 LOG_PREFIX="openclaw-upstream"
 
-# ─── 环境检测 ────────────────────────────────────────────────
+# ─── Kiểm tra môi trường ──────────────────────────────────────
 detect_os() {
   case "$OSTYPE" in
     darwin*)  echo "mac" ;;
@@ -39,7 +39,7 @@ detect_node() {
   echo ""
 }
 
-# 查询占用指定端口的 PID（跨平台）
+# Truy vấn PID đang chiếm dụng cổng chỉ định (đa nền tảng)
 port_pid() {
   local port=$1
   if command -v lsof >/dev/null 2>&1; then
@@ -52,7 +52,7 @@ port_pid() {
   fi
 }
 
-# 打开浏览器（跨平台）
+# Mở trình duyệt (đa nền tảng)
 open_browser() {
   local url=$1
   case "$OS" in
@@ -63,13 +63,13 @@ open_browser() {
       if command -v xdg-open >/dev/null 2>&1; then
         xdg-open "$url" 2>/dev/null &
       else
-        echo "请手动在浏览器中打开: $url"
+        echo "Vui lòng mở địa chỉ này thủ công trong trình duyệt: $url"
       fi
       ;;
   esac
 }
 
-# 临时日志路径（Windows 不一定有 /tmp）
+# Đường dẫn log tạm thời (Windows không nhất thiết có /tmp)
 tmp_log() {
   if [ -d /tmp ]; then
     echo "/tmp/openclaw-upstream-gateway.log"
@@ -84,11 +84,11 @@ LOG_FILE="$SCRIPT_DIR/logs/openclaw-upstream.log"
 TMP_LOG=$(tmp_log)
 
 if [ -z "$NODE" ]; then
-  echo "✗ 未找到 node，请先安装 Node.js: https://nodejs.org"
+  echo "✗ Không tìm thấy node, vui lòng cài đặt Node.js trước: https://nodejs.org"
   exit 1
 fi
 
-# ─── 初始化 ──────────────────────────────────────────────────
+# ─── Khởi tạo ──────────────────────────────────────────────────
 mkdir -p "$STATE_DIR"
 mkdir -p "$SCRIPT_DIR/logs"
 
@@ -96,25 +96,25 @@ EXAMPLE_CONFIG="$SCRIPT_DIR/.openclaw-state.example/openclaw.json"
 if [ ! -f "$CONFIG_FILE" ]; then
   if [ -f "$EXAMPLE_CONFIG" ]; then
     cp "$EXAMPLE_CONFIG" "$CONFIG_FILE"
-    echo "已从示例复制配置文件: $EXAMPLE_CONFIG -> $CONFIG_FILE"
+    echo "Đã sao chép file cấu hình từ ví dụ: $EXAMPLE_CONFIG -> $CONFIG_FILE"
   else
     echo '{}' > "$CONFIG_FILE"
-    echo "已创建空配置文件: $CONFIG_FILE（建议从 .openclaw-state.example/openclaw.json 复制完整配置）"
+    echo "Đã tạo file cấu hình trống: $CONFIG_FILE (Khuyên dùng: sao chép cấu hình đầy đủ từ .openclaw-state.example/openclaw.json)"
   fi
 fi
 
-# 从配置文件动态读取 token，回退到环境变量
+# Đọc token động từ file cấu hình, nếu không có thì dùng biến môi trường
 GATEWAY_TOKEN=$(jq -r '.gateway.auth.token // empty' "$CONFIG_FILE" 2>/dev/null)
 if [ -z "$GATEWAY_TOKEN" ]; then
   GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-}"
 fi
 
-# ─── 功能函数 ────────────────────────────────────────────────
+# ─── Các hàm chức năng ────────────────────────────────────────
 stop_gateway() {
   if [ -f "$PID_FILE" ]; then
     OLD_PID=$(cat "$PID_FILE")
     if kill -0 "$OLD_PID" 2>/dev/null; then
-      echo "停止旧进程 (PID: $OLD_PID)..."
+      echo "Đang dừng tiến trình cũ (PID: $OLD_PID)..."
       kill "$OLD_PID" 2>/dev/null
       sleep 1
       if kill -0 "$OLD_PID" 2>/dev/null; then
@@ -126,7 +126,7 @@ stop_gateway() {
 
   PORT_PID=$(port_pid "$PORT")
   if [ -n "$PORT_PID" ]; then
-    echo "停止占用端口 $PORT 的进程 (PID: $PORT_PID)..."
+    echo "Đang dừng tiến trình chiếm dụng cổng $PORT (PID: $PORT_PID)..."
     kill "$PORT_PID" 2>/dev/null
     sleep 1
   fi
@@ -137,30 +137,30 @@ start_gateway() {
   export OPENCLAW_STATE_DIR="$STATE_DIR"
   export OPENCLAW_GATEWAY_PORT="$PORT"
 
-  echo "系统: $OS  |  Node: $($NODE --version 2>/dev/null)"
-  echo "启动 Gateway 服务..."
-  echo "配置文件: $OPENCLAW_CONFIG_PATH"
-  echo "状态目录: $OPENCLAW_STATE_DIR"
-  echo "日志文件: $TMP_LOG"
-  echo "端口: $PORT"
+  echo "Hệ điều hành: $OS  |  Node: $($NODE --version 2>/dev/null)"
+  echo "Đang khởi động dịch vụ Gateway..."
+  echo "File cấu hình: $OPENCLAW_CONFIG_PATH"
+  echo "Thư mục trạng thái: $OPENCLAW_STATE_DIR"
+  echo "File log tạm: $TMP_LOG"
+  echo "Cổng: $PORT"
   echo ""
 
   nohup "$NODE" "$SCRIPT_DIR/openclaw.mjs" gateway --port "$PORT" > "$TMP_LOG" 2>&1 &
   GATEWAY_PID=$!
   echo "$GATEWAY_PID" > "$PID_FILE"
 
-  echo "等待 Gateway 就绪..."
+  echo "Đang chờ Gateway sẵn sàng..."
   WEBUI_READY=0
   i=0
   while [ $i -lt 30 ]; do
     i=$((i + 1))
     if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:$PORT/" 2>/dev/null; then
-      echo "Gateway 已就绪 (${i}s)"
+      echo "Gateway đã sẵn sàng (${i}s)"
       WEBUI_READY=1
       break
     fi
     if ! kill -0 $GATEWAY_PID 2>/dev/null; then
-      echo "Gateway 进程已退出，启动失败"
+      echo "Tiến trình Gateway đã thoát, khởi động thất bại"
       cat "$TMP_LOG"
       rm -f "$PID_FILE"
       exit 1
@@ -170,19 +170,19 @@ start_gateway() {
 
   if kill -0 $GATEWAY_PID 2>/dev/null; then
     if [ "$WEBUI_READY" -eq 0 ]; then
-      echo "⚠ curl 检测未成功，Gateway 可能尚未就绪，请稍后手动打开 Web UI"
+      echo "⚠ Kiểm tra bằng curl không thành công, Gateway có thể chưa sẵn sàng, vui lòng mở Web UI thủ công sau giây lát"
     fi
     WEBUI_URL="http://127.0.0.1:$PORT/#token=${GATEWAY_TOKEN}"
-    echo "Gateway 服务已启动 (PID: $GATEWAY_PID)"
+    echo "Dịch vụ Gateway đã khởi động (PID: $GATEWAY_PID)"
     echo "Web UI: $WEBUI_URL"
     if [ "$WEBUI_READY" -eq 1 ]; then
-      echo "正在打开浏览器..."
+      echo "Đang mở trình duyệt..."
       open_browser "$WEBUI_URL"
     else
-      echo "请手动在浏览器中打开上述地址"
+      echo "Vui lòng mở địa chỉ trên thủ công trong trình duyệt"
     fi
   else
-    echo "Gateway 服务启动失败，请查看日志:"
+    echo "Khởi động dịch vụ Gateway thất bại, vui lòng kiểm tra log:"
     cat "$TMP_LOG"
     rm -f "$PID_FILE"
     exit 1
@@ -190,29 +190,30 @@ start_gateway() {
 }
 
 update_cookie() {
-  echo "更新 Claude Web Cookie..."
+  echo "Đang cập nhật Claude Web Cookie..."
 
   if [ -z "$2" ]; then
-    echo "错误：请提供完整的 cookie 字符串"
-    echo "用法: $0 update-cookie \"完整的cookie字符串\""
+    echo "Lỗi: Vui lòng cung cấp chuỗi cookie đầy đủ"
+    echo "Cách dùng: $0 update-cookie \"chuỗi_cookie_đầy_đủ\""
     echo ""
-    echo "从浏览器获取 cookie："
-    echo "1. 打开 https://claude.ai"
-    echo "2. 按 F12 打开开发者工具"
-    echo "3. 切换到 Network 标签"
-    echo "4. 发送一条消息"
-    echo "5. 找到 completion 请求"
-    echo "6. 复制 Request Headers 中的完整 cookie 值"
+    echo "Cách lấy cookie từ trình duyệt:"
+    echo "1. Truy cập https://claude.ai"
+    echo "2. Nhấn F12 để mở công cụ nhà phát triển"
+    echo "3. Chuyển sang tab Network"
+    echo "4. Gửi một tin nhắn bất kỳ"
+    echo "5. Tìm yêu cầu (request) 'completion'"
+    echo "6. Sao chép giá trị 'cookie' đầy đủ trong phần Request Headers"
     exit 1
   fi
 
   COOKIE_STRING="$2"
   AUTH_FILE="$STATE_DIR/agents/main/agent/auth-profiles.json"
 
-  SESSION_KEY=$(echo "$COOKIE_STRING" | grep -oP 'sessionKey=\K[^;]+' || echo "")
+  # Sử dụng grep để trích xuất sessionKey
+  SESSION_KEY=$(echo "$COOKIE_STRING" | grep -o 'sessionKey=[^;]*' | cut -d'=' -f2 || echo "")
 
   if [ -z "$SESSION_KEY" ]; then
-    echo "错误：cookie 中未找到 sessionKey"
+    echo "Lỗi: Không tìm thấy sessionKey trong cookie"
     exit 1
   fi
 
@@ -227,18 +228,18 @@ EOF
 
   if [ -f "$AUTH_FILE" ]; then
     jq --arg key "$JSON_DATA" '.profiles["claude-web:default"].key = $key' "$AUTH_FILE" > "$AUTH_FILE.tmp" && mv "$AUTH_FILE.tmp" "$AUTH_FILE"
-    echo "✓ Claude Web cookie 已更新"
+    echo "✓ Đã cập nhật Claude Web cookie"
     echo "✓ SessionKey: ${SESSION_KEY:0:50}..."
     echo ""
-    echo "现在重启服务："
+    echo "Bây giờ hãy khởi động lại dịch vụ:"
     echo "  $0 restart"
   else
-    echo "错误：auth-profiles.json 不存在，请先运行 ./onboard.sh"
+    echo "Lỗi: File auth-profiles.json không tồn tại, vui lòng chạy ./onboard.sh trước"
     exit 1
   fi
 }
 
-# ─── 入口 ────────────────────────────────────────────────────
+# ─── Điểm vào (Entrypoint) ───────────────────────────────────
 case "${1:-start}" in
   start)
     stop_gateway
@@ -246,7 +247,7 @@ case "${1:-start}" in
     ;;
   stop)
     stop_gateway
-    echo "Gateway 服务已停止"
+    echo "Dịch vụ Gateway đã dừng"
     ;;
   restart)
     stop_gateway
@@ -256,17 +257,17 @@ case "${1:-start}" in
     if [ -f "$PID_FILE" ]; then
       PID=$(cat "$PID_FILE")
       if kill -0 "$PID" 2>/dev/null; then
-        echo "Gateway 服务运行中 (PID: $PID)"
+        echo "Dịch vụ Gateway đang chạy (PID: $PID)"
         echo "Web UI: http://127.0.0.1:$PORT/#token=${GATEWAY_TOKEN}"
       else
-        echo "Gateway 服务未运行 (PID 文件存在但进程已退出)"
+        echo "Dịch vụ Gateway không chạy (File PID tồn tại nhưng tiến trình đã thoát)"
       fi
     else
       PORT_PID=$(port_pid "$PORT")
       if [ -n "$PORT_PID" ]; then
-        echo "端口 $PORT 被进程 $PORT_PID 占用，但不是本脚本启动的 Gateway"
+        echo "Cổng $PORT đang bị chiếm dụng bởi tiến trình $PORT_PID, nhưng không phải do Gateway này khởi động"
       else
-        echo "Gateway 服务未运行"
+        echo "Dịch vụ Gateway hiện không chạy"
       fi
     fi
     ;;
@@ -274,16 +275,16 @@ case "${1:-start}" in
     update_cookie "$@"
     ;;
   *)
-    echo "用法: $0 {start|stop|restart|status|update-cookie}"
+    echo "Cách dùng: $0 {start|stop|restart|status|update-cookie}"
     echo ""
-    echo "命令说明："
-    echo "  start         - 启动 Gateway 服务"
-    echo "  stop          - 停止 Gateway 服务"
-    echo "  restart       - 重启 Gateway 服务"
-    echo "  status        - 查看服务状态"
-    echo "  update-cookie - 更新 Claude Web cookie"
+    echo "Giải thích các lệnh:"
+    echo "  start         - Khởi động dịch vụ Gateway"
+    echo "  stop          - Dừng dịch vụ Gateway"
+    echo "  restart       - Khởi động lại dịch vụ Gateway"
+    echo "  status        - Kiểm tra trạng thái dịch vụ"
+    echo "  update-cookie - Cập nhật Claude Web cookie"
     echo ""
-    echo "示例："
+    echo "Ví dụ:"
     echo "  $0 update-cookie \"sessionKey=sk-ant-...; anthropic-device-id=...\""
     exit 1
     ;;
