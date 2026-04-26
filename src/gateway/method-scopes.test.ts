@@ -57,6 +57,9 @@ describe("operator scope authorization", () => {
     ["health", ["operator.read"], { allowed: true }],
     ["health", ["operator.write"], { allowed: true }],
     ["config.schema.lookup", ["operator.read"], { allowed: true }],
+    ["directory.self", ["operator.read"], { allowed: true }],
+    ["directory.peers.list", ["operator.read"], { allowed: true }],
+    ["directory.groups.list", ["operator.read"], { allowed: true }],
     ["config.patch", ["operator.admin"], { allowed: true }],
   ])("authorizes %s for scopes %j", (method, scopes, expected) => {
     expect(authorizeOperatorScopesForMethod(method, scopes)).toEqual(expected);
@@ -134,5 +137,15 @@ describe("core gateway method classification", () => {
       (method) => !isGatewayMethodClassified(method),
     );
     expect(unclassified).toEqual([]);
+  });
+
+  it("exposes directory gateway methods for channel contact pickers", () => {
+    const methods = listGatewayMethods();
+    expect(methods).toContain("directory.self");
+    expect(methods).toContain("directory.peers.list");
+    expect(methods).toContain("directory.groups.list");
+    expect(coreGatewayHandlers).toHaveProperty("directory.self");
+    expect(coreGatewayHandlers).toHaveProperty("directory.peers.list");
+    expect(coreGatewayHandlers).toHaveProperty("directory.groups.list");
   });
 });
