@@ -307,9 +307,11 @@ export function resolveGatewayStartupPluginIds(params: {
       if (plugin.channels.some((channelId) => configuredChannelIds.has(channelId))) {
         return true;
       }
-      if (plugin.channels.length > 0) {
-        return false;
-      }
+      // Channel-only plugins must not be dropped here: operators often enable
+      // `plugins.entries.<id>` (or `plugins.allow`) before `channels.<id>` has
+      // any key beyond `enabled` — `listPotentialConfiguredChannelIds` treats
+      // `{ enabled: true }` alone as non-meaningful. Without loading the plugin,
+      // gateway helpers such as `web.login.start` cannot find a QR provider.
       if (
         plugin.origin === "bundled" &&
         (plugin.providers.some((providerId) =>

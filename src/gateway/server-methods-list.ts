@@ -99,6 +99,8 @@ const BASE_METHODS = [
   "node.invoke.result",
   "node.event",
   "node.canvas.capability.refresh",
+  "web.login.start",
+  "web.login.wait",
   "cron.list",
   "cron.status",
   "cron.add",

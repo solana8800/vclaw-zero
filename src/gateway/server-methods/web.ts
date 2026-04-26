@@ -12,8 +12,10 @@ import type { GatewayRequestHandlers, RespondFn } from "./types.js";
 const WEB_LOGIN_METHODS = new Set(["web.login.start", "web.login.wait"]);
 
 const resolveWebLoginProvider = () =>
-  listChannelPlugins().find((plugin) =>
-    (plugin.gatewayMethods ?? []).some((method) => WEB_LOGIN_METHODS.has(method)),
+  listChannelPlugins().find(
+    (plugin) =>
+      typeof plugin.gateway?.loginWithQrStart === "function" ||
+      (plugin.gatewayMethods ?? []).some((method) => WEB_LOGIN_METHODS.has(method)),
   ) ?? null;
 
 function resolveAccountId(params: unknown): string | undefined {

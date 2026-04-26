@@ -155,4 +155,17 @@ describe("resolveGatewayStartupPluginIds", () => {
   ] as const)("%s", (_name, config, expected) => {
     expectStartupPluginIdsCase({ config, expected });
   });
+
+  it("loads an explicitly allowed channel plugin before channels.* has meaningful config", () => {
+    listPotentialConfiguredChannelIds.mockReturnValue([]);
+    expectStartupPluginIds(
+      {
+        plugins: {
+          allow: ["demo-channel"],
+          entries: { "demo-channel": { enabled: true } },
+        },
+      } as OpenClawConfig,
+      ["demo-channel", "demo-global-sidecar"],
+    );
+  });
 });
