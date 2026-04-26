@@ -92,6 +92,15 @@ describe("getStatusSummary", () => {
     expect(summary.channelSummary).toEqual(["ok"]);
   });
 
+  it("includes resolved provider for default and recent session models", async () => {
+    const summary = await getStatusSummary();
+
+    expect(summary.sessions.defaults).toMatchObject({
+      provider: "openai",
+      model: "gpt-5.5",
+    });
+  });
+
   it("skips channel summary imports when no channels are configured", async () => {
     vi.mocked(hasPotentialConfiguredChannels).mockReturnValue(false);
 

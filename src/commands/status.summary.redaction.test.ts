@@ -13,6 +13,7 @@ function createRecentSessionRow() {
     totalTokensFresh: true,
     remainingTokens: 4,
     percentUsed: 5,
+    modelProvider: "openai",
     model: "gpt-5",
     contextTokens: 200_000,
     flags: ["id:sess-1"],
@@ -32,7 +33,7 @@ describe("redactSensitiveStatusSummary", () => {
       sessions: {
         paths: ["/tmp/openclaw/sessions.json"],
         count: 1,
-        defaults: { model: "gpt-5", contextTokens: 200_000 },
+        defaults: { provider: "openai", model: "gpt-5", contextTokens: 200_000 },
         recent: [createRecentSessionRow()],
         byAgent: [
           {
@@ -47,7 +48,11 @@ describe("redactSensitiveStatusSummary", () => {
 
     const redacted = redactSensitiveStatusSummary(input);
     expect(redacted.sessions.paths).toEqual([]);
-    expect(redacted.sessions.defaults).toEqual({ model: null, contextTokens: null });
+    expect(redacted.sessions.defaults).toEqual({
+      provider: null,
+      model: null,
+      contextTokens: null,
+    });
     expect(redacted.sessions.recent).toEqual([]);
     expect(redacted.sessions.byAgent[0]?.path).toBe("[redacted]");
     expect(redacted.sessions.byAgent[0]?.recent).toEqual([]);

@@ -81,6 +81,7 @@ export function redactSensitiveStatusSummary(summary: StatusSummary): StatusSumm
       ...summary.sessions,
       paths: [],
       defaults: {
+        provider: null,
         model: null,
         contextTokens: null,
       },
@@ -220,6 +221,7 @@ export async function getStatusSummary(
           totalTokensFresh,
           remainingTokens: remaining,
           percentUsed: pct,
+          modelProvider: resolvedModel.provider ?? null,
           model,
           contextTokens,
           flags: buildFlags(entry),
@@ -267,6 +269,7 @@ export async function getStatusSummary(
       paths: Array.from(paths),
       count: totalSessions,
       defaults: {
+        provider: resolved.provider ?? null,
         model: configModel ?? null,
         contextTokens: configContextTokens ?? null,
       },

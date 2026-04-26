@@ -22,6 +22,7 @@ export type SessionStatus = {
   cacheWrite?: number;
   remainingTokens: number | null;
   percentUsed: number | null;
+  modelProvider: string | null;
   model: string | null;
   contextTokens: number | null;
   flags: string[];
@@ -51,7 +52,7 @@ export type StatusSummary = {
   sessions: {
     paths: string[];
     count: number;
-    defaults: { model: string | null; contextTokens: number | null };
+    defaults: { provider: string | null; model: string | null; contextTokens: number | null };
     recent: SessionStatus[];
     byAgent: Array<{
       agentId: string;
