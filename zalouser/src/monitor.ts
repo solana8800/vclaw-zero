@@ -39,6 +39,7 @@ import {
   isZalouserGroupEntryAllowed,
 } from "./group-policy.js";
 import { formatZalouserMessageSidFull, resolveZalouserMessageSid } from "./message-sid.js";
+import { prepareZalouserOutboundFromText } from "./outbound-media.js";
 import { getZalouserRuntime } from "./runtime.js";
 import {
   sendDeliveredZalouser,
@@ -703,8 +704,18 @@ async function deliverZalouserReply(params: {
   statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
   tableMode?: MarkdownTableMode;
 }): Promise<void> {
-  const { payload, profile, chatId, isGroup, runtime, core, config, accountId, statusSink } =
-    params;
+  const { profile, chatId, isGroup, runtime, core, config, accountId, statusSink } = params;
+  let { payload } = params;
+  const hasExplicitMedia = Boolean(
+    (typeof payload.mediaUrl === "string" && payload.mediaUrl.trim()) ||
+    (Array.isArray(payload.mediaUrls) && payload.mediaUrls.length > 0),
+  );
+  if (!hasExplicitMedia && typeof payload.text === "string" && payload.text.trim()) {
+    const split = prepareZalouserOutboundFromText(payload.text);
+    if (split.mediaUrl) {
+      payload = { ...payload, text: split.message, mediaUrl: split.mediaUrl, mediaUrls: undefined };
+    }
+  }
   const tableMode = params.tableMode ?? "code";
   const reply = resolveSendableOutboundReplyParts(payload, {
     text: core.channel.text.convertMarkdownTables(payload.text ?? "", tableMode),
