@@ -99,7 +99,7 @@ case "${1:-}" in
     echo ""
     echo "⚠️  Nhớ bật Chrome debug trước (./start-chrome-debug.sh — cổng 9222)."
     echo ""
-    "$NODE" "$SCRIPT_DIR/openclaw.mjs" onboard webauth
+    "$NODE" "$SCRIPT_DIR/openclaw.mjs" onboard webauth "${@:2}"
     ;;
   onboard)
     echo "Đang mở trình onboard chính thức..."

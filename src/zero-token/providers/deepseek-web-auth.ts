@@ -1,11 +1,15 @@
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
+import { chromium, type Browser, type BrowserContext } from "playwright-core";
 import { getHeadersWithAuth } from "../../../extensions/browser/src/browser/cdp.helpers.js";
 import {
   launchOpenClawChrome,
   stopOpenClawChrome,
   getChromeWebSocketUrl,
+  type RunningChrome,
 } from "../../../extensions/browser/src/browser/chrome.js";
-import { resolveBrowserConfig, resolveProfile } from "../../../extensions/browser/src/browser/config.js";
+import {
+  resolveBrowserConfig,
+  resolveProfile,
+} from "../../../extensions/browser/src/browser/config.js";
 import { loadConfig } from "../../config/io.js";
 
 /**
@@ -25,12 +29,10 @@ export async function loginDeepseekWebAttachOnly(params: {
   // Always use attach mode - connect to existing Chrome
   params.onProgress("Connecting to existing Chrome...");
 
-  let running: { cdpPort: number } | null = null;
   let browser: Browser | null = null;
   let context: BrowserContext | null = null;
 
   try {
-    running = { cdpPort: profile.cdpPort };
     const cdpUrl = profile.cdpUrl || `http://127.0.0.1:${profile.cdpPort}`;
 
     // Wait for Chrome debugger
@@ -61,8 +63,32 @@ export async function loginDeepseekWebAttachOnly(params: {
     );
 
     if (!page) {
-      // 没有 DeepSeek 页面，创建新页面
-      page = await context.newPage();
+      try {
+        page = await context.newPage();
+      } catch (err: unknown) {
+        if (err instanceof Error && err.message.includes("Protocol error")) {
+          // Nếu không thể tạo page mới qua CDP (thường gặp trong Electron),
+          // thử dùng window.open qua page hiện tại để tạo tab mới
+          const firstPage = context.pages()[0];
+          if (firstPage) {
+            params.onProgress("Creating new tab via window.open...");
+            await firstPage.evaluate((url) => window.open(url), "https://chat.deepseek.com");
+            // Đợi tab mới xuất hiện
+            for (let i = 0; i < 10; i++) {
+              await new Promise((r) => setTimeout(r, 500));
+              page = context.pages().find((p) => p.url().includes("deepseek.com"));
+              if (page) {
+                break;
+              }
+            }
+          }
+          if (!page) {
+            page = firstPage;
+          }
+        } else {
+          throw err;
+        }
+      }
       params.onProgress("Opening DeepSeek page...");
     } else {
       // 已有 DeepSeek 页面，切换到该页面
@@ -105,7 +131,7 @@ export async function loginDeepseekWebAttachOnly(params: {
 
       // Check localStorage for token
       try {
-        const localStorage = await page.evaluate(() => {
+        const storageData = await page.evaluate(() => {
           const data: Record<string, string> = {};
           for (let i = 0; i < localStorage.length; i++) {
             const key = localStorage.key(i);
@@ -117,7 +143,7 @@ export async function loginDeepseekWebAttachOnly(params: {
         });
 
         // Look for auth token in localStorage
-        for (const [key, value] of Object.entries(localStorage)) {
+        for (const [key, value] of Object.entries(storageData)) {
           if (key.toLowerCase().includes("token") || key.toLowerCase().includes("auth")) {
             try {
               const parsed = JSON.parse(value);
@@ -275,9 +301,14 @@ export interface DeepSeekWebCredentials {
 export async function loginDeepseekWeb(params: {
   onProgress: (msg: string) => void;
   openUrl: (url: string) => Promise<boolean>;
+  headless?: boolean;
 }): Promise<DeepSeekWebCredentials> {
+  const { headless = false } = params;
   const rootConfig = loadConfig();
   const browserConfig = resolveBrowserConfig(rootConfig.browser, rootConfig);
+  if (headless) {
+    browserConfig.headless = true;
+  }
   const profile = resolveProfile(browserConfig, browserConfig.defaultProfile);
   if (!profile) {
     throw new Error(`Could not resolve browser profile '${browserConfig.defaultProfile}'`);
@@ -331,8 +362,32 @@ export async function loginDeepseekWeb(params: {
     );
 
     if (!page) {
-      // 没有 DeepSeek 页面，创建新页面
-      page = await context.newPage();
+      try {
+        page = await context.newPage();
+      } catch (err: unknown) {
+        if (err instanceof Error && err.message.includes("Protocol error")) {
+          // Nếu không thể tạo page mới qua CDP (thường gặp trong Electron),
+          // thử dùng window.open qua page hiện tại để tạo tab mới
+          const firstPage = context.pages()[0];
+          if (firstPage) {
+            params.onProgress("Creating new tab via window.open...");
+            await firstPage.evaluate((url) => window.open(url), "https://chat.deepseek.com");
+            // Đợi tab mới xuất hiện
+            for (let i = 0; i < 10; i++) {
+              await new Promise((r) => setTimeout(r, 500));
+              page = context.pages().find((p) => p.url().includes("deepseek.com"));
+              if (page) {
+                break;
+              }
+            }
+          }
+          if (!page) {
+            page = firstPage;
+          }
+        } else {
+          throw err;
+        }
+      }
       params.onProgress("Opening DeepSeek page...");
     } else {
       // 已有 DeepSeek 页面，切换到该页面
@@ -378,7 +433,7 @@ export async function loginDeepseekWeb(params: {
           }
         }
       } catch (e) {
-        console.log(`[DeepSeek] Could not auto-capture token: ${e}`);
+        console.log(`[DeepSeek] Could not auto-capture token: ${String(e)}`);
       }
 
       // API 返回没有 token（可能过期），清除会话状态让用户重新登录
@@ -516,7 +571,7 @@ export async function loginDeepseekWeb(params: {
     );
   } finally {
     if (didLaunch && running && "proc" in running) {
-      await stopOpenClawChrome(running);
+      await stopOpenClawChrome(running as RunningChrome);
     }
   }
 }

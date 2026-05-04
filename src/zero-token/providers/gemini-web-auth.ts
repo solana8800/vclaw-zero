@@ -4,8 +4,12 @@ import {
   launchOpenClawChrome,
   stopOpenClawChrome,
   getChromeWebSocketUrl,
+  type RunningChrome,
 } from "../../../extensions/browser/src/browser/chrome.js";
-import { resolveBrowserConfig, resolveProfile } from "../../../extensions/browser/src/browser/config.js";
+import {
+  resolveBrowserConfig,
+  resolveProfile,
+} from "../../../extensions/browser/src/browser/config.js";
 import { loadConfig } from "../../config/io.js";
 
 export interface GeminiWebAuthResult {
@@ -26,6 +30,9 @@ export async function loginGeminiWeb(
 
   const rootConfig = loadConfig();
   const browserConfig = resolveBrowserConfig(rootConfig.browser, rootConfig);
+  if (headless) {
+    browserConfig.headless = true;
+  }
   const profile = resolveProfile(browserConfig, browserConfig.defaultProfile);
   if (!profile) {
     throw new Error(`Could not resolve browser profile '${browserConfig.defaultProfile}'`);
@@ -46,7 +53,7 @@ export async function loginGeminiWeb(
     running = { cdpPort: profile.cdpPort };
   } else {
     onProgress("Launching browser...");
-    running = await launchOpenClawChrome(browserConfig, profile, { headless });
+    running = await launchOpenClawChrome(browserConfig, profile);
     didLaunch = true;
   }
 
@@ -74,7 +81,39 @@ export async function loginGeminiWeb(
       headers: getHeadersWithAuth(wsUrl),
     });
     const context = browser.contexts()[0];
-    const page = context.pages()[0] || (await context.newPage());
+    const existingPages = context.pages();
+    let page = existingPages.find(
+      (p) => p.url().includes("gemini.google.com") || p.url().includes("accounts.google.com"),
+    );
+
+    if (!page) {
+      try {
+        page = await context.newPage();
+      } catch (err: unknown) {
+        if (err instanceof Error && err.message.includes("Protocol error")) {
+          // Nếu không thể tạo page mới qua CDP (thường gặp trong Electron),
+          // thử dùng window.open qua page hiện tại để tạo tab mới
+          const firstPage = context.pages()[0];
+          if (firstPage) {
+            onProgress("Creating new tab via window.open...");
+            await firstPage.evaluate((url) => window.open(url), "https://gemini.google.com/app");
+            // Đợi tab mới xuất hiện
+            for (let i = 0; i < 10; i++) {
+              await new Promise((r) => setTimeout(r, 500));
+              page = context.pages().find((p) => p.url().includes("google.com"));
+              if (page) {
+                break;
+              }
+            }
+          }
+          if (!page) {
+            page = context.pages()[0];
+          }
+        } else {
+          throw err;
+        }
+      }
+    }
 
     onProgress("Navigating to Gemini...");
     await page.goto("https://gemini.google.com/app", { waitUntil: "domcontentloaded" });

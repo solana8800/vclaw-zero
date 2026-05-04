@@ -108,12 +108,19 @@ export function registerOnboardCommand(program: Command) {
 
   command
     .command("webauth")
-    .description("Web 模型授权向导 - 授权 Claude/ChatGPT/DeepSeek 等无需 API Key 的 Web 模型")
-    .action(async () => {
+    .description(
+      "Trình hướng dẫn xác thực mô hình Web - Kích hoạt Claude/ChatGPT/DeepSeek mà không cần API Key",
+    )
+    .option(
+      "--providers <ids>",
+      "Danh sách các provider muốn kích hoạt, cách nhau bằng dấu phẩy (ví dụ: deepseek-web,gemini-web)",
+    )
+    .option("--headless", "Chạy trình duyệt ở chế độ headless (ẩn giao diện)", false)
+    .action(async (options: { providers?: string; headless: boolean }) => {
       // Playwright / CDP / timers keep the Node event loop alive after auth;
       // explicit exit so shell scripts (e.g. vclaw-zero.sh) continue to gateway start.
       try {
-        await runOnboardWebAuth();
+        await runOnboardWebAuth(options);
         process.exit(0);
       } catch (err) {
         console.error(err);
