@@ -35,7 +35,10 @@ export function createChatGPTWebStreamFn(cookieOrJson: string): StreamFn {
       try {
         await client.init();
 
-        const sessionKey = (context as unknown as { sessionId?: string }).sessionId || "default";
+        const sessionKey =
+          (streamOptions as unknown as { sessionId?: string })?.sessionId ||
+          (context as unknown as { sessionId?: string }).sessionId ||
+          "default";
         let conversationId = conversationMap.get(sessionKey);
         let parentMessageId = parentMessageMap.get(sessionKey);
 

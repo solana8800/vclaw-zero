@@ -31,7 +31,10 @@ export function createQwenCNWebStreamFn(cookieOrJson: string): StreamFn {
       try {
         await client.init();
 
-        const sessionKey = (context as unknown as { sessionId?: string }).sessionId || "default";
+        const sessionKey =
+          (streamOptions as unknown as { sessionId?: string })?.sessionId ||
+          (context as unknown as { sessionId?: string }).sessionId ||
+          "default";
         let sessionId = sessionMap.get(sessionKey);
 
         const messages = context.messages || [];
