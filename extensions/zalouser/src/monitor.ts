@@ -69,6 +69,84 @@ export type ZalouserMonitorResult = {
 
 const ZALOUSER_TEXT_LIMIT = 2000;
 
+const VCLAW_ENRICH_DEFAULT_URL = "http://127.0.0.1:12687/api/vclaw/enrich";
+const VCLAW_ENRICH_TIMEOUT_MS = 1_500;
+
+function isTruthyEnv(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test(value?.trim() ?? "");
+}
+
+function isFalsyEnv(value: string | undefined): boolean {
+  return /^(0|false|no|off)$/i.test(value?.trim() ?? "");
+}
+
+function shouldUseVclawEnrichment(commandBody: string): boolean {
+  const enabled = process.env.VCLAW_ZALOUSER_ENRICH_ENABLED;
+  if (isFalsyEnv(enabled)) {
+    return false;
+  }
+  if ((process.env.NODE_ENV === "test" || process.env.VITEST) && !isTruthyEnv(enabled)) {
+    return false;
+  }
+  if (commandBody.trim().startsWith("/")) {
+    return false;
+  }
+  return true;
+}
+
+function resolveVclawEnrichUrl(): string {
+  return (
+    process.env.VCLAW_ZALOUSER_ENRICH_URL?.trim() ||
+    process.env.VCLAW_ENRICH_URL?.trim() ||
+    VCLAW_ENRICH_DEFAULT_URL
+  );
+}
+
+async function resolveVclawEnrichedAgentBody(params: {
+  rawBody: string;
+  commandBody: string;
+  externalId: string;
+  runtime: RuntimeEnv;
+}): Promise<string | undefined> {
+  if (!shouldUseVclawEnrichment(params.commandBody)) {
+    return undefined;
+  }
+  const enrichUrl = resolveVclawEnrichUrl();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), VCLAW_ENRICH_TIMEOUT_MS);
+  try {
+    const response = await fetch(enrichUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        message: params.rawBody,
+        pathname: "/",
+        channel: "zalo",
+        externalId: params.externalId,
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      params.runtime.error?.(`zalouser: VClaw enrich failed status=${response.status}`);
+      return undefined;
+    }
+    const payload = (await response.json()) as { ok?: boolean; prompt?: unknown };
+    const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
+    if (payload.ok !== true || !prompt) {
+      params.runtime.error?.("zalouser: VClaw enrich returned empty prompt");
+      return undefined;
+    }
+    return prompt;
+  } catch (err) {
+    params.runtime.error?.(`zalouser: VClaw enrich unavailable: ${String(err)}`);
+    return undefined;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function normalizeZalouserEntry(entry: string): string {
   return entry.replace(/^(zalouser|zlu):/i, "").trim();
 }
@@ -270,6 +348,7 @@ async function processMessage(
     logVerbose(core, runtime, `zalouser: drop message ${chatId} (missing senderId)`);
     return;
   }
+
   const senderName = message.senderName ?? "";
   const configuredGroupName = message.groupName?.trim() || "";
   const groupContext =
@@ -586,10 +665,17 @@ async function processMessage(
       : undefined;
 
   const normalizedTo = isGroup ? `zalouser:group:${chatId}` : `zalouser:${chatId}`;
+  const externalId = isGroup ? `group:${chatId}` : `user:${senderId}`;
+  const enrichedAgentBody = await resolveVclawEnrichedAgentBody({
+    rawBody,
+    commandBody,
+    externalId,
+    runtime,
+  });
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: combinedBody,
-    BodyForAgent: rawBody,
+    BodyForAgent: enrichedAgentBody ?? rawBody,
     InboundHistory: inboundHistory,
     RawBody: rawBody,
     CommandBody: commandBody,

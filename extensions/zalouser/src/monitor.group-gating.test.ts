@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
 import "./monitor.send-mocks.js";
 import "./zalo-js.test-mocks.js";
@@ -247,6 +247,12 @@ describe("zalouser monitor group mention gating", () => {
     sendTypingZalouserMock.mockClear();
     sendDeliveredZalouserMock.mockClear();
     sendSeenZalouserMock.mockClear();
+  });
+
+  afterEach(() => {
+    delete process.env.VCLAW_ZALOUSER_ENRICH_ENABLED;
+    delete process.env.VCLAW_ZALOUSER_ENRICH_URL;
+    vi.unstubAllGlobals();
   });
 
   async function processMessageWithDefaults(params: {
@@ -606,6 +612,40 @@ describe("zalouser monitor group mention gating", () => {
     );
     const callArg = dispatchReplyWithBufferedBlockDispatcher.mock.calls[0]?.[0];
     expect(callArg?.ctx?.SessionKey).toBe("agent:main:zalouser:direct:321");
+  });
+
+  it("injects VClaw enriched catalog context into DM agent body", async () => {
+    process.env.VCLAW_ZALOUSER_ENRICH_ENABLED = "1";
+    process.env.VCLAW_ZALOUSER_ENRICH_URL = "http://vclaw.test/api/vclaw/enrich";
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        prompt:
+          "[VCLAW_BUSINESS_BRAIN]\n[DANH_MỤC_SẢN_PHẨM]\n- Vé vào cổng Khu du lịch Núi Bà Đen (Tây Ninh): 10.000đ",
+      }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { dispatchReplyWithBufferedBlockDispatcher } = await processOpenDmMessage({
+      message: { content: "mua sản phẩm rẻ nhất xem là sản phẩm gì" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://vclaw.test/api/vclaw/enrich",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          message: "mua sản phẩm rẻ nhất xem là sản phẩm gì",
+          pathname: "/",
+          channel: "zalo",
+          externalId: "user:321",
+        }),
+      }),
+    );
+    const callArg = dispatchReplyWithBufferedBlockDispatcher.mock.calls[0]?.[0];
+    expect(callArg?.ctx?.BodyForAgent).toContain("Vé vào cổng Khu du lịch Núi Bà Đen");
+    expect(callArg?.ctx?.BodyForCommands).toBe("mua sản phẩm rẻ nhất xem là sản phẩm gì");
   });
 
   it("reuses the legacy DM session key when only the old group-shaped session exists", async () => {
