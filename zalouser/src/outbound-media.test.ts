@@ -22,4 +22,14 @@ describe("prepareZalouserOutboundFromText", () => {
       mediaUrl: "https://img.vietqr.io/image/X-compact.png",
     });
   });
+
+  it("không nhận diện Unsplash URL không có extension trong pathname là ảnh", () => {
+    const result = prepareZalouserOutboundFromText(
+      "Ve cap treo Ba Na Hills https://images.unsplash.com/photo-1559592442-741eaf739780?w=1200&q=80",
+    );
+    expect(result).toEqual({
+      message:
+        "Ve cap treo Ba Na Hills https://images.unsplash.com/photo-1559592442-741eaf739780?w=1200&q=80",
+    });
+  });
 });

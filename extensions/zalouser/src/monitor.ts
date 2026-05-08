@@ -102,12 +102,18 @@ function resolveVclawEnrichUrl(): string {
   );
 }
 
-async function resolveVclawEnrichedAgentBody(params: {
+type VclawEnrichDecision = {
+  prompt?: string;
+  skipAutoReply?: boolean;
+  reason?: string;
+};
+
+async function resolveVclawEnrichedAgentDecision(params: {
   rawBody: string;
   commandBody: string;
   externalId: string;
   runtime: RuntimeEnv;
-}): Promise<string | undefined> {
+}): Promise<VclawEnrichDecision | undefined> {
   if (!shouldUseVclawEnrichment(params.commandBody)) {
     return undefined;
   }
@@ -132,13 +138,28 @@ async function resolveVclawEnrichedAgentBody(params: {
       params.runtime.error?.(`zalouser: VClaw enrich failed status=${response.status}`);
       return undefined;
     }
-    const payload = (await response.json()) as { ok?: boolean; prompt?: unknown };
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      prompt?: unknown;
+      metadata?: {
+        automationEnabled?: unknown;
+        skipAutoReply?: unknown;
+        reason?: unknown;
+      };
+    };
+    if (payload.metadata?.automationEnabled === false || payload.metadata?.skipAutoReply === true) {
+      const reason =
+        typeof payload.metadata?.reason === "string"
+          ? payload.metadata.reason
+          : "automation_disabled";
+      return { skipAutoReply: true, reason };
+    }
     const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
     if (payload.ok !== true || !prompt) {
       params.runtime.error?.("zalouser: VClaw enrich returned empty prompt");
       return undefined;
     }
-    return prompt;
+    return { prompt };
   } catch (err) {
     params.runtime.error?.(`zalouser: VClaw enrich unavailable: ${String(err)}`);
     return undefined;
@@ -666,7 +687,7 @@ async function processMessage(
 
   const normalizedTo = isGroup ? `zalouser:group:${chatId}` : `zalouser:${chatId}`;
   const externalId = isGroup ? `group:${chatId}` : `user:${senderId}`;
-  const enrichedAgentBody = await resolveVclawEnrichedAgentBody({
+  const enrichDecision = await resolveVclawEnrichedAgentDecision({
     rawBody,
     commandBody,
     externalId,
@@ -675,7 +696,7 @@ async function processMessage(
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: combinedBody,
-    BodyForAgent: enrichedAgentBody ?? rawBody,
+    BodyForAgent: enrichDecision?.prompt ?? rawBody,
     InboundHistory: inboundHistory,
     RawBody: rawBody,
     CommandBody: commandBody,
@@ -716,6 +737,15 @@ async function processMessage(
       runtime.error?.(`zalouser: failed updating session meta: ${String(err)}`);
     },
   });
+
+  if (enrichDecision?.skipAutoReply) {
+    runtime.log?.(
+      `[${account.accountId}] zalouser auto-reply skipped by VClaw approval gate: ${
+        enrichDecision.reason ?? "automation_disabled"
+      }`,
+    );
+    return;
+  }
 
   const { onModelSelected, ...replyPipeline } = createChannelReplyPipeline({
     cfg: config,

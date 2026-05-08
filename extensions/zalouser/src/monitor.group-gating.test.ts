@@ -648,6 +648,32 @@ describe("zalouser monitor group mention gating", () => {
     expect(callArg?.ctx?.BodyForCommands).toBe("mua sản phẩm rẻ nhất xem là sản phẩm gì");
   });
 
+  it("skips DM auto-reply when VClaw automation gate is disabled", async () => {
+    process.env.VCLAW_ZALOUSER_ENRICH_ENABLED = "1";
+    process.env.VCLAW_ZALOUSER_ENRICH_URL = "http://vclaw.test/api/vclaw/enrich";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          ok: true,
+          prompt: "",
+          metadata: {
+            automationEnabled: false,
+            skipAutoReply: true,
+            reason: "automation_disabled",
+          },
+        }),
+      })),
+    );
+
+    const { dispatchReplyWithBufferedBlockDispatcher } = await processOpenDmMessage({
+      message: { content: "alo shop" },
+    });
+
+    expect(dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+  });
+
   it("reuses the legacy DM session key when only the old group-shaped session exists", async () => {
     const { dispatchReplyWithBufferedBlockDispatcher } = await processOpenDmMessage({
       readSessionUpdatedAt: (input?: { storePath: string; sessionKey: string }) =>
