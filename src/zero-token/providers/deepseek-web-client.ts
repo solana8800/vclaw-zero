@@ -310,7 +310,7 @@ export class DeepSeekWebClient {
         thinking_enabled: !(
           params.model === "deepseek-chat" && !params.model?.includes("reasoning")
         ), // Default to true unless specifically chat-only
-        search_enabled: params.searchEnabled ?? true,
+        search_enabled: params.searchEnabled ?? false,
         preempt: params.preempt ?? false,
       }),
       signal: params.signal,

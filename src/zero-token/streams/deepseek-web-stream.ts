@@ -180,8 +180,12 @@ export function createDeepseekWebStreamFn(cookieOrJson: string): StreamFn {
           throw new Error("No message found to send to DeepSeek web API");
         }
 
+        const modelId = model.id.endsWith("-search")
+          ? model.id.slice(0, -"-search".length)
+          : model.id;
         const searchEnabled =
-          (options as unknown as { searchEnabled?: boolean })?.searchEnabled ?? true;
+          (options as unknown as { searchEnabled?: boolean })?.searchEnabled ??
+          model.id.endsWith("-search");
         const preempt = (options as unknown as { preempt?: boolean })?.preempt ?? false;
         const fileIds = (options as unknown as { fileIds?: string[] })?.fileIds || [];
 
@@ -189,7 +193,7 @@ export function createDeepseekWebStreamFn(cookieOrJson: string): StreamFn {
           sessionId: dsSessionId,
           parentMessageId: parentId,
           message: prompt,
-          model: model.id,
+          model: modelId,
           searchEnabled,
           preempt,
           fileIds,

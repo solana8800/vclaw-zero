@@ -104,12 +104,16 @@
   },
   "tools": {
     "profile": "full",
+    "deny": ["web_search", "web_fetch", "x_search", "browser"],
     "web": {
       "search": {
-        "enabled": true
+        "enabled": false
       },
       "fetch": {
-        "enabled": true
+        "enabled": false
+      },
+      "x_search": {
+        "enabled": false
       }
     },
     "sessions": {
