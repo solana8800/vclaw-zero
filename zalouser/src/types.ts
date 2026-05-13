@@ -33,9 +33,13 @@ export type ZaloEventMessage = {
 export type ZaloInboundMessage = {
   threadId: string;
   isGroup: boolean;
+  /** true khi message đến từ kênh/trang (type không phải User=0 hoặc Group=1). */
+  isChannel?: boolean;
   senderId: string;
   senderName?: string;
   groupName?: string;
+  /** msgType từ payload zca-js (OA/card/sticker…) — tiện log và placeholder. */
+  msgType?: string;
   content: string;
   commandContent?: string;
   timestampMs: number;

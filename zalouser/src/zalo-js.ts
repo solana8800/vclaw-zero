@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { resolveStateDir as resolvePluginStateDir } from "openclaw/plugin-sdk/state-paths";
 import { loadOutboundMediaFromUrl } from "../runtime-api.js";
 import { normalizeZaloReactionIcon } from "./reaction.js";
@@ -18,6 +20,7 @@ import type {
   ZcaFriend,
   ZcaUserInfo,
 } from "./types.js";
+import { normalizeZaloInboundTextContent } from "./zalo-inbound-text.js";
 import {
   TextStyle,
   type API,
@@ -39,6 +42,9 @@ const GROUP_CONTEXT_CACHE_TTL_MS = 5 * 60_000;
 const GROUP_CONTEXT_CACHE_MAX_ENTRIES = 500;
 const LISTENER_WATCHDOG_INTERVAL_MS = 30_000;
 const LISTENER_WATCHDOG_MAX_GAP_MS = 35_000;
+const LISTENER_OLD_MESSAGES_SYNC_INTERVAL_MS = 15_000;
+const LISTENER_DEDUPE_MAX_ENTRIES = 2_000;
+const ZALO_CHANNEL_THREAD_TYPE = 2;
 
 const apiByProfile = new Map<string, API>();
 const apiInitByProfile = new Map<string, Promise<API>>();
@@ -61,6 +67,38 @@ type ActiveZaloListener = {
   accountId: string;
   stop: () => void;
 };
+
+type ZaloWsFrameHeader = {
+  version: number;
+  cmd: number;
+  subCmd: number;
+  bytes: number;
+};
+
+type ZaloListenerWithRawSocket = {
+  ws?: {
+    on?: (event: "message", callback: (data: unknown) => void) => unknown;
+    off?: (event: "message", callback: (data: unknown) => void) => unknown;
+    removeListener?: (event: "message", callback: (data: unknown) => void) => unknown;
+  } | null;
+  cipherKey?: string;
+};
+
+type ZcaJsUtilsRuntime = {
+  decodeEventData: (parsed: Record<string, unknown>, cipherKey?: string) => Promise<unknown>;
+};
+
+type DecodedZaloWsMessageBatch = {
+  source: "decoded_msgs" | "decoded_groupMsgs" | "decoded_pageMsgs";
+  messages: Message[];
+};
+
+type ExtractDecodedZaloWsMessageBatchesOptions = {
+  pageMessagesOnly?: boolean;
+};
+
+const requireFromHere = createRequire(import.meta.url);
+let zcaJsUtilsRuntimePromise: Promise<ZcaJsUtilsRuntime> | null = null;
 
 const activeListeners = new Map<string, ActiveZaloListener>();
 const groupContextCache = new Map<string, { value: ZaloGroupContext; expiresAt: number }>();
@@ -136,6 +174,300 @@ function toErrorMessage(error: unknown): string {
   return String(error);
 }
 
+async function loadZcaJsUtilsRuntime(): Promise<ZcaJsUtilsRuntime> {
+  zcaJsUtilsRuntimePromise ??= (async () => {
+    const indexPath = requireFromHere.resolve("zca-js");
+    const indexDir = path.dirname(indexPath);
+    const distDir =
+      path.basename(indexPath) === "index.cjs" && path.basename(indexDir) === "cjs"
+        ? path.dirname(indexDir)
+        : indexDir;
+    const utilsUrl = pathToFileURL(path.join(distDir, "utils.js")).href;
+    return (await import(utilsUrl)) as unknown as ZcaJsUtilsRuntime;
+  })();
+  return await zcaJsUtilsRuntimePromise;
+}
+
+function stringifyForZalouserLog(value: unknown): string {
+  const seen = new WeakSet();
+  return JSON.stringify(value, (_key, item) => {
+    if (typeof item === "bigint") {
+      return item.toString();
+    }
+    if (item && typeof item === "object") {
+      if (seen.has(item)) {
+        return "[Circular]";
+      }
+      seen.add(item);
+    }
+    return item;
+  });
+}
+
+function truncateForZalouserLog(value: string, maxLength = 2_400): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, maxLength)}...<truncated ${value.length - maxLength} chars>`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function asRecordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(asRecord(item)))
+    : [];
+}
+
+function bufferFromWsFrameData(data: unknown): Buffer | null {
+  if (Buffer.isBuffer(data)) {
+    return data;
+  }
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(data);
+  }
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  }
+  return null;
+}
+
+function decodeZaloWsFrameHeader(data: unknown): ZaloWsFrameHeader | null {
+  const buffer = bufferFromWsFrameData(data);
+  if (!buffer || buffer.byteLength < 4) {
+    return null;
+  }
+  return {
+    version: buffer[0] ?? 0,
+    cmd: buffer.readUInt16LE(1),
+    subCmd: buffer[3] ?? 0,
+    bytes: buffer.byteLength,
+  };
+}
+
+function describeKnownZaloWsCommand(cmd: number, subCmd: number): string {
+  if (cmd === 1 && subCmd === 1) {
+    return "cipher_key";
+  }
+  if (cmd === 501 && subCmd === 0) {
+    return "user_message";
+  }
+  if (cmd === 521 && subCmd === 0) {
+    return "group_message";
+  }
+  if (cmd === 510 && subCmd === 1) {
+    return "old_user_messages";
+  }
+  if (cmd === 511 && subCmd === 1) {
+    return "old_group_messages";
+  }
+  if (cmd === 601 && subCmd === 0) {
+    return "control";
+  }
+  if (cmd === 602 && subCmd === 0) {
+    return "typing";
+  }
+  if (cmd === 610 || cmd === 611 || cmd === 612) {
+    return "reaction";
+  }
+  if (cmd === 502 || cmd === 522) {
+    return "delivery_seen";
+  }
+  if (cmd === 3000) {
+    return "duplicate_connection";
+  }
+  return "unknown";
+}
+
+function shouldDecodeZaloWsFrameForPageMessages(header: ZaloWsFrameHeader): boolean {
+  if (header.version !== 1) {
+    return false;
+  }
+  if (header.cmd === 501 && header.subCmd === 0) {
+    return true;
+  }
+  if ((header.cmd === 510 || header.cmd === 513 || header.cmd === 515) && header.subCmd <= 1) {
+    return true;
+  }
+  return false;
+}
+
+async function logDecodedZaloWsFrame(
+  data: unknown,
+  listener: ZaloListenerWithRawSocket,
+  profile: string,
+  header: ZaloWsFrameHeader,
+  options?: ExtractDecodedZaloWsMessageBatchesOptions,
+  onDecodedMessageBatch?: (batch: DecodedZaloWsMessageBatch, header: ZaloWsFrameHeader) => void,
+): Promise<void> {
+  const buffer = bufferFromWsFrameData(data);
+  if (!buffer || buffer.byteLength <= 4) {
+    return;
+  }
+  const jsonText = new TextDecoder("utf-8").decode(buffer.subarray(4));
+  if (!jsonText.trim()) {
+    return;
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(jsonText) as Record<string, unknown>;
+  } catch (error) {
+    if (shouldLogZalouserRawInbound()) {
+      writeZalouserInboundDiag(
+        `[zalouser][ws-frame-decode-error] profile=${profile} cmd=${header.cmd} subCmd=${header.subCmd} parse=${toErrorMessage(
+          error,
+        )}`,
+      );
+    }
+    return;
+  }
+  try {
+    const { decodeEventData } = await loadZcaJsUtilsRuntime();
+    const decoded = await decodeEventData(parsed, listener.cipherKey);
+    if (shouldLogZalouserRawInbound()) {
+      writeZalouserInboundDiag(
+        `[zalouser][ws-frame-decoded] profile=${profile} cmd=${header.cmd} subCmd=${header.subCmd} data=${truncateForZalouserLog(
+          stringifyForZalouserLog(decoded) ?? "null",
+        )}`,
+      );
+    }
+    for (const batch of extractDecodedZaloWsMessageBatches(decoded, options)) {
+      onDecodedMessageBatch?.(batch, header);
+    }
+  } catch (error) {
+    if (shouldLogZalouserRawInbound()) {
+      writeZalouserInboundDiag(
+        `[zalouser][ws-frame-decode-error] profile=${profile} cmd=${header.cmd} subCmd=${header.subCmd} keys=${Object.keys(
+          parsed,
+        )
+          .slice(0, 12)
+          .join(",")} error=${toErrorMessage(error)}`,
+      );
+    }
+  }
+}
+
+function decodedMessageRecordToMessage(
+  data: Record<string, unknown>,
+  type: number,
+): Message | null {
+  const threadId =
+    type === ThreadType.Group
+      ? pickFirstNumberId(data, ["idTo", "threadId"])
+      : type === ThreadType.User
+        ? pickFirstNumberId(data, ["uidFrom", "fromUid", "senderUid", "senderId", "idTo"])
+        : pickFirstNonZeroNumberId(data, [
+            "threadId",
+            "pageId",
+            "channelId",
+            "oaId",
+            "uidFrom",
+            "fromUid",
+            "senderUid",
+            "senderId",
+            "idTo",
+          ]);
+  if (!threadId) {
+    return null;
+  }
+  return {
+    type,
+    threadId,
+    isSelf: false,
+    data,
+  };
+}
+
+function extractDecodedZaloWsMessageBatches(
+  decoded: unknown,
+  options?: ExtractDecodedZaloWsMessageBatchesOptions,
+): DecodedZaloWsMessageBatch[] {
+  const root = asRecord(decoded);
+  const data = asRecord(root?.data);
+  if (!data) {
+    return [];
+  }
+  const batches: DecodedZaloWsMessageBatch[] = [];
+  if (!options?.pageMessagesOnly) {
+    const userMessages = asRecordArray(data.msgs)
+      .map((item) => decodedMessageRecordToMessage(item, ThreadType.User))
+      .filter((item): item is Message => item !== null);
+    if (userMessages.length > 0) {
+      batches.push({ source: "decoded_msgs", messages: userMessages });
+    }
+    const groupMessages = asRecordArray(data.groupMsgs)
+      .map((item) => decodedMessageRecordToMessage(item, ThreadType.Group))
+      .filter((item): item is Message => item !== null);
+    if (groupMessages.length > 0) {
+      batches.push({ source: "decoded_groupMsgs", messages: groupMessages });
+    }
+  }
+  const pageMessages = asRecordArray(data.pageMsgs)
+    .map((item) => decodedMessageRecordToMessage(item, ZALO_CHANNEL_THREAD_TYPE))
+    .filter((item): item is Message => item !== null);
+  if (pageMessages.length > 0) {
+    batches.push({ source: "decoded_pageMsgs", messages: pageMessages });
+  }
+  return batches;
+}
+
+function installZaloWsFrameTap(
+  listener: unknown,
+  profile: string,
+  onDecodedMessageBatch?: (batch: DecodedZaloWsMessageBatch, header: ZaloWsFrameHeader) => void,
+): () => void {
+  const rawListener = listener as ZaloListenerWithRawSocket;
+  const socket = rawListener.ws;
+  if (!socket || typeof socket.on !== "function") {
+    if (shouldLogZalouserRawInbound()) {
+      writeZalouserInboundDiag(
+        `[zalouser][ws-frame-tap] profile=${profile} không truy cập được raw WebSocket từ zca-js`,
+      );
+    }
+    return () => {};
+  }
+  const onRawFrame = (data: unknown) => {
+    const header = decodeZaloWsFrameHeader(data);
+    if (!header) {
+      if (shouldLogZalouserRawInbound()) {
+        writeZalouserInboundDiag(`[zalouser][ws-frame] profile=${profile} unreadable`);
+      }
+      return;
+    }
+    if (shouldLogZalouserRawInbound()) {
+      writeZalouserInboundDiag(
+        `[zalouser][ws-frame] profile=${profile} version=${header.version} cmd=${header.cmd} subCmd=${header.subCmd} bytes=${header.bytes} known=${describeKnownZaloWsCommand(
+          header.cmd,
+          header.subCmd,
+        )}`,
+      );
+    }
+    const known = describeKnownZaloWsCommand(header.cmd, header.subCmd);
+    if (known === "unknown" || shouldDecodeZaloWsFrameForPageMessages(header)) {
+      void logDecodedZaloWsFrame(
+        data,
+        rawListener,
+        profile,
+        header,
+        known === "unknown" ? undefined : { pageMessagesOnly: true },
+        onDecodedMessageBatch,
+      );
+    }
+  };
+  socket.on("message", onRawFrame);
+  return () => {
+    if (typeof socket.off === "function") {
+      socket.off("message", onRawFrame);
+      return;
+    }
+    socket.removeListener?.("message", onRawFrame);
+  };
+}
+
 function clampTextStyles(
   text: string,
   styles?: ZaloSendOptions["textStyles"],
@@ -182,6 +514,100 @@ function toNumberId(value: unknown): string {
   return "";
 }
 
+function pickFirstNumberId(data: Record<string, unknown>, keys: readonly string[]): string {
+  for (const key of keys) {
+    const v = toNumberId(data[key]);
+    if (v) {
+      return v;
+    }
+  }
+  return "";
+}
+
+function pickFirstNonZeroNumberId(data: Record<string, unknown>, keys: readonly string[]): string {
+  for (const key of keys) {
+    const v = toNumberId(data[key]);
+    if (v && v !== "0") {
+      return v;
+    }
+  }
+  return "";
+}
+
+function shouldLogZalouserRawInbound(): boolean {
+  const v = process.env.OPENCLAW_ZALOUSER_LOG_RAW_INBOUND?.trim().toLowerCase();
+  return v !== "0" && v !== "false" && v !== "no" && v !== "off";
+}
+
+function resolveOldMessagesSyncIntervalMs(): number {
+  const raw = process.env.OPENCLAW_ZALOUSER_OLD_MESSAGES_SYNC_MS?.trim();
+  if (!raw) {
+    return LISTENER_OLD_MESSAGES_SYNC_INTERVAL_MS;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return LISTENER_OLD_MESSAGES_SYNC_INTERVAL_MS;
+  }
+  return parsed === 0 ? 0 : Math.max(parsed, 5_000);
+}
+
+/** Ghi thẳng stderr (không qua console đã patch) — luôn vào file log của `nohup … >log 2>&1`. */
+function writeZalouserInboundDiag(line: string): void {
+  try {
+    process.stderr.write(`${line}\n`);
+  } catch {
+    // ignore
+  }
+}
+
+/** Gợi ý vì sao OA/Page không map được (thiếu id trong payload). */
+function explainToInboundNull(message: Message, ownUserId?: string): string {
+  const data = message.data;
+  const isGroup = message.type === ThreadType.Group;
+  const isChannel = !isGroup && message.type !== ThreadType.User;
+  const wrap = message as Message & { threadId?: unknown };
+  const wrapperThreadId = toNumberId(wrap.threadId);
+  const senderId = pickFirstNumberId(data, [
+    "uidFrom",
+    "fromUid",
+    "senderUid",
+    "senderId",
+    "srcUid",
+    "userId",
+    "pageId",
+    "fromPageId",
+    "oaId",
+    "fromId",
+    "src",
+  ]);
+  const threadId = isGroup
+    ? pickFirstNumberId(data, ["idTo", "threadId"]) || wrapperThreadId
+    : isChannel
+      ? pickFirstNumberId(data, ["idTo", "threadId", "pageId", "channelId", "oaId"]) ||
+        wrapperThreadId
+      : wrapperThreadId ||
+        pickFirstNumberId(data, ["uidFrom", "fromUid", "senderUid", "senderId"]) ||
+        toNumberId(data.uidFrom) ||
+        toNumberId(data.idTo);
+  const keys =
+    data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data).slice(0, 40) : [];
+  return JSON.stringify({
+    isGroup,
+    isChannel,
+    type: message.type,
+    wrapperThreadId: wrapperThreadId || null,
+    computedThreadId: threadId || null,
+    computedSenderId: senderId || null,
+    rawUidFrom: data.uidFrom,
+    rawIdTo: data.idTo,
+    rawPageId: data.pageId,
+    rawOaId: data.oaId,
+    msgType: data.msgType,
+    ownUserId: ownUserId ?? null,
+    dataKeys: keys,
+  });
+}
+
 function toStringValue(value: unknown): string {
   if (typeof value === "string") {
     return value.trim();
@@ -203,14 +629,14 @@ function normalizeAccountInfoUser(info: AccountInfoResponse): User | null {
     }
     return null;
   }
-  return info as User;
+  return info;
 }
 
 function toInteger(value: unknown, fallback = 0): number {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.trunc(value);
   }
-  const parsed = Number.parseInt(String(value ?? ""), 10);
+  const parsed = Number.parseInt(typeof value === "string" ? value : "", 10);
   if (!Number.isFinite(parsed)) {
     return fallback;
   }
@@ -218,32 +644,14 @@ function toInteger(value: unknown, fallback = 0): number {
 }
 
 function normalizeMessageContent(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (!content || typeof content !== "object") {
-    return "";
-  }
-  const record = content as Record<string, unknown>;
-  const title = typeof record.title === "string" ? record.title.trim() : "";
-  const description = typeof record.description === "string" ? record.description.trim() : "";
-  const href = typeof record.href === "string" ? record.href.trim() : "";
-  const combined = [title, description, href].filter(Boolean).join("\n").trim();
-  if (combined) {
-    return combined;
-  }
-  try {
-    return JSON.stringify(content);
-  } catch {
-    return "";
-  }
+  return normalizeZaloInboundTextContent(content);
 }
 
 function resolveInboundTimestamp(rawTs: unknown): number {
   if (typeof rawTs === "number" && Number.isFinite(rawTs)) {
     return rawTs > 1_000_000_000_000 ? rawTs : rawTs * 1000;
   }
-  const parsed = Number.parseInt(String(rawTs ?? ""), 10);
+  const parsed = Number.parseInt(typeof rawTs === "string" ? rawTs : "", 10);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     return Date.now();
   }
@@ -404,6 +812,177 @@ function buildEventMessage(data: Record<string, unknown>): ZaloEventMessage | un
     cmd: toInteger(data.cmd, 0),
     ts: toStringValue(data.ts) || Date.now(),
   };
+}
+
+function resolveInboundDedupeKey(message: ZaloInboundMessage): string {
+  const scope = message.isGroup ? "group" : message.isChannel ? "channel" : "user";
+  const threadId = message.threadId.trim();
+  const senderId = message.senderId.trim();
+  const msgId = message.msgId?.trim();
+  const cliMsgId = message.cliMsgId?.trim();
+  if (msgId || cliMsgId) {
+    return `${scope}:${threadId}:${senderId}:msg:${msgId ?? ""}:cli:${cliMsgId ?? ""}`;
+  }
+  return `${scope}:${threadId}:${senderId}:ts:${message.timestampMs}:body:${message.content.slice(
+    0,
+    200,
+  )}`;
+}
+
+function rememberInboundDedupeKey(params: {
+  key: string;
+  seen: Set<string>;
+  order: string[];
+}): boolean {
+  if (params.seen.has(params.key)) {
+    return false;
+  }
+  params.seen.add(params.key);
+  params.order.push(params.key);
+  while (params.order.length > LISTENER_DEDUPE_MAX_ENTRIES) {
+    const oldest = params.order.shift();
+    if (oldest) {
+      params.seen.delete(oldest);
+    }
+  }
+  return true;
+}
+
+type ZaloDirectorySnapshot = {
+  friends: Map<string, string>;
+  groups: Map<string, string>;
+};
+
+function resolveConversationKind(params: {
+  message: ZaloInboundMessage;
+  historyType?: number;
+  directory: ZaloDirectorySnapshot;
+}): "friend" | "group" | "channel_candidate" | "nonfriend" | "unknown" {
+  if (params.message.isGroup || params.historyType === ThreadType.Group) {
+    return "group";
+  }
+  if (params.message.isChannel) {
+    return "channel_candidate";
+  }
+  if (params.directory.friends.has(params.message.senderId)) {
+    return "friend";
+  }
+  if (params.directory.groups.has(params.message.threadId)) {
+    return "group";
+  }
+  if (params.message.senderId || params.message.threadId) {
+    return "channel_candidate";
+  }
+  return "unknown";
+}
+
+function summarizeInboundMessageForLog(params: {
+  message: ZaloInboundMessage;
+  index?: number;
+  historyType?: number;
+  directory: ZaloDirectorySnapshot;
+}): string {
+  const preview = (params.message.content || params.message.commandContent || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+  const historyType =
+    params.historyType === ThreadType.Group
+      ? "group"
+      : params.historyType === ThreadType.User
+        ? "user"
+        : undefined;
+  const conversationKind = resolveConversationKind({
+    message: params.message,
+    historyType: params.historyType,
+    directory: params.directory,
+  });
+  return JSON.stringify({
+    index: params.index ?? null,
+    source: historyType ? "old_messages" : "realtime",
+    historyType,
+    conversationKind,
+    scope: params.message.isGroup ? "group" : params.message.isChannel ? "channel" : "user",
+    threadId: params.message.threadId,
+    senderId: params.message.senderId,
+    senderName: params.message.senderName ?? null,
+    directoryName:
+      params.directory.friends.get(params.message.senderId) ??
+      params.directory.groups.get(params.message.threadId) ??
+      null,
+    msgType: params.message.msgType ?? null,
+    msgId: params.message.msgId ?? null,
+    cliMsgId: params.message.cliMsgId ?? null,
+    timestampMs: params.message.timestampMs,
+    preview,
+  });
+}
+
+async function loadDirectorySnapshotForLogs(
+  api: API,
+  profile: string,
+): Promise<ZaloDirectorySnapshot> {
+  const [friendsResult, groupsResult] = await Promise.allSettled([
+    api.getAllFriends(),
+    api.getAllGroups(),
+  ]);
+  const friends = new Map<string, string>();
+  if (friendsResult.status === "fulfilled") {
+    for (const friend of friendsResult.value) {
+      const id = toNumberId(friend.userId);
+      if (id) {
+        friends.set(id, friend.displayName || friend.zaloName || friend.username || id);
+      }
+    }
+  } else if (shouldLogZalouserRawInbound()) {
+    writeZalouserInboundDiag(
+      `[zalouser][directory-error] profile=${profile} friends=${toErrorMessage(friendsResult.reason)}`,
+    );
+  }
+  const groups = new Map<string, string>();
+  if (groupsResult.status === "fulfilled") {
+    const ids = Object.keys(groupsResult.value.gridVerMap ?? {});
+    if (ids.length > 0) {
+      const groupInfoResult = await Promise.allSettled([fetchGroupsByIds(api, ids)]);
+      const groupInfo = groupInfoResult[0];
+      if (groupInfo?.status === "fulfilled") {
+        for (const [groupId, info] of groupInfo.value) {
+          groups.set(groupId, info.name?.trim() || groupId);
+        }
+      } else if (groupInfo?.status === "rejected" && shouldLogZalouserRawInbound()) {
+        writeZalouserInboundDiag(
+          `[zalouser][directory-error] profile=${profile} groupInfo=${toErrorMessage(groupInfo.reason)}`,
+        );
+      }
+    }
+  } else if (shouldLogZalouserRawInbound()) {
+    writeZalouserInboundDiag(
+      `[zalouser][directory-error] profile=${profile} groups=${toErrorMessage(groupsResult.reason)}`,
+    );
+  }
+  if (shouldLogZalouserRawInbound()) {
+    writeZalouserInboundDiag(
+      `[zalouser][directory] profile=${profile} friends=${friends.size} groups=${groups.size}`,
+    );
+  }
+  return { friends, groups };
+}
+
+function isLikelyOwnDecodedPageMessage(message: Message, ownUserId?: string): boolean {
+  if (message.type !== ZALO_CHANNEL_THREAD_TYPE) {
+    return false;
+  }
+  const data = message.data;
+  const senderId = pickFirstNumberId(data, [
+    "uidFrom",
+    "fromUid",
+    "senderUid",
+    "senderId",
+    "srcUid",
+    "userId",
+  ]);
+  const normalizedOwnUserId = toNumberId(ownUserId);
+  return senderId === "0" || Boolean(normalizedOwnUserId && senderId === normalizedOwnUserId);
 }
 
 function extractSendMessageId(result: unknown): string | undefined {
@@ -617,7 +1196,7 @@ async function ensureApi(
   const initPromise = (async () => {
     const stored = readCredentials(profile);
     if (!stored) {
-      throw new Error(`No saved Zalo session for profile \"${profile}\"`);
+      throw new Error(`No saved Zalo session for profile "${profile}"`);
     }
     const zalo = await createZalo({
       logging: false,
@@ -631,7 +1210,7 @@ async function ensureApi(
         language: stored.language,
       }),
       timeoutMs,
-      `Timed out restoring Zalo session for profile \"${profile}\"`,
+      `Timed out restoring Zalo session for profile "${profile}"`,
     );
     apiByProfile.set(profile, api);
     touchCredentials(profile);
@@ -776,13 +1355,46 @@ function extractGroupMembersFromInfo(
 }
 
 function toInboundMessage(message: Message, ownUserId?: string): ZaloInboundMessage | null {
-  const data = message.data as Record<string, unknown>;
+  const data = message.data;
   const isGroup = message.type === ThreadType.Group;
-  const senderId = toNumberId(data.uidFrom);
+  // Các message type ngoài User(0) và Group(1) là kênh/trang broadcast.
+  const isChannel = !isGroup && message.type !== ThreadType.User;
+  const wrapperThreadId = toNumberId((message as Message & { threadId?: unknown }).threadId);
+  const senderId = pickFirstNumberId(data, [
+    "uidFrom",
+    "fromUid",
+    "senderUid",
+    "senderId",
+    "srcUid",
+    "userId",
+    // Kênh/trang: sender là page/channel, không có uidFrom
+    "pageId",
+    "fromPageId",
+    "oaId",
+    "fromId",
+    "src",
+  ]);
   const threadId = isGroup
-    ? toNumberId(data.idTo)
-    : toNumberId(data.uidFrom) || toNumberId(data.idTo);
-  if (!threadId || !senderId) {
+    ? pickFirstNumberId(data, ["idTo", "threadId"]) || wrapperThreadId
+    : isChannel
+      ? pickFirstNonZeroNumberId(data, [
+          "threadId",
+          "pageId",
+          "channelId",
+          "oaId",
+          "uidFrom",
+          "fromUid",
+          "senderUid",
+          "senderId",
+          "idTo",
+        ]) || wrapperThreadId
+      : wrapperThreadId ||
+        pickFirstNumberId(data, ["uidFrom", "fromUid", "senderUid", "senderId"]) ||
+        toNumberId(data.uidFrom) ||
+        toNumberId(data.idTo);
+  // Với kênh/trang: kênh chính là sender — fallback về threadId nếu không tìm được sender riêng.
+  const resolvedSenderId = senderId || (isChannel ? threadId : "");
+  if (!threadId || !resolvedSenderId) {
     return null;
   }
   const content = normalizeMessageContent(data.content);
@@ -806,12 +1418,15 @@ function toInboundMessage(message: Message, ownUserId?: string): ZaloInboundMess
     normalizedOwnUserId && quoteOwnerId && quoteOwnerId === normalizedOwnUserId,
   );
   const eventMessage = buildEventMessage(data);
+  const msgTypeRaw = toStringValue(data.msgType);
   return {
     threadId,
     isGroup,
-    senderId,
+    isChannel: isChannel || undefined,
+    senderId: resolvedSenderId,
     senderName: typeof data.dName === "string" ? data.dName.trim() || undefined : undefined,
     groupName: isGroup ? resolveGroupNameFromMessageData(data) : undefined,
+    msgType: msgTypeRaw || undefined,
     content,
     commandContent,
     timestampMs: resolveInboundTimestamp(data.ts),
@@ -886,7 +1501,7 @@ export async function listZaloFriendsMatching(
       return { friend, exact, includes };
     })
     .filter((entry) => entry.includes)
-    .sort((a, b) => Number(b.exact) - Number(a.exact));
+    .toSorted((a, b) => Number(b.exact) - Number(a.exact));
   return scored.map((entry) => entry.friend);
 }
 
@@ -1502,15 +2117,24 @@ export async function startZaloListener(params: {
   const existing = activeListeners.get(profile);
   if (existing) {
     throw new Error(
-      `Zalo listener already running for profile \"${profile}\" (account \"${existing.accountId}\")`,
+      `Zalo listener already running for profile "${profile}" (account "${existing.accountId}")`,
     );
   }
 
   const api = await ensureApi(profile);
   const ownUserId = await resolveOwnUserId(api);
+  const directorySnapshot = shouldLogZalouserRawInbound()
+    ? await loadDirectorySnapshotForLogs(api, profile)
+    : { friends: new Map<string, string>(), groups: new Map<string, string>() };
   let stopped = false;
   let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  let oldMessagesTimer: ReturnType<typeof setInterval> | null = null;
+  let detachWsFrameTap: (() => void) | null = null;
   let lastWatchdogTickAt = Date.now();
+  const oldMessagesBaselineSeen = new Set<number>();
+  let oldMessagesConnected = false;
+  const seenInboundKeys = new Set<string>();
+  const seenInboundOrder: string[] = [];
 
   const cleanup = () => {
     if (stopped) {
@@ -1521,8 +2145,18 @@ export async function startZaloListener(params: {
       clearInterval(watchdogTimer);
       watchdogTimer = null;
     }
+    if (oldMessagesTimer) {
+      clearInterval(oldMessagesTimer);
+      oldMessagesTimer = null;
+    }
+    if (detachWsFrameTap) {
+      detachWsFrameTap();
+      detachWsFrameTap = null;
+    }
     try {
+      api.listener.off("connected", onConnected);
       api.listener.off("message", onMessage);
+      api.listener.off("old_messages", onOldMessages);
       api.listener.off("error", onError);
       api.listener.off("closed", onClosed);
     } catch {
@@ -1536,15 +2170,199 @@ export async function startZaloListener(params: {
     activeListeners.delete(profile);
   };
 
-  const onMessage = (incoming: Message) => {
-    if (incoming.isSelf) {
-      return;
-    }
-    const normalized = toInboundMessage(incoming, ownUserId);
-    if (!normalized) {
+  const dispatchNormalized = (normalized: ZaloInboundMessage): void => {
+    const key = resolveInboundDedupeKey(normalized);
+    if (!rememberInboundDedupeKey({ key, seen: seenInboundKeys, order: seenInboundOrder })) {
       return;
     }
     params.onMessage(normalized);
+  };
+
+  const onMessage = (incoming: Message) => {
+    const dbg = shouldLogZalouserRawInbound();
+    if (incoming.isSelf) {
+      if (dbg) {
+        const wrap = incoming as Message & { threadId?: unknown };
+        writeZalouserInboundDiag(
+          `[zalouser][skip-self] type=${incoming.type} threadId=${String(wrap.threadId ?? "")}`,
+        );
+      }
+      return;
+    }
+    if (dbg) {
+      try {
+        const wrap = incoming as Message & { threadId?: unknown };
+        const snippet = JSON.stringify(incoming.data ?? {}).slice(0, 8000);
+        writeZalouserInboundDiag(
+          `[zalouser][raw-inbound] type=${incoming.type} threadId=${String(wrap.threadId ?? "")} data=${snippet}`,
+        );
+      } catch {
+        writeZalouserInboundDiag("[zalouser][raw-inbound] (không serialize được payload)");
+      }
+    }
+    const normalized = toInboundMessage(incoming, ownUserId);
+    if (!normalized) {
+      if (dbg) {
+        writeZalouserInboundDiag(
+          `[zalouser][drop-null] toInboundMessage trả null — kiểm tra uidFrom/idTo/msgType. ${explainToInboundNull(incoming, ownUserId)}`,
+        );
+      }
+      return;
+    }
+    if (dbg) {
+      writeZalouserInboundDiag(
+        `[zalouser][inbound-normalized] ${summarizeInboundMessageForLog({
+          message: normalized,
+          directory: directorySnapshot,
+        })}`,
+      );
+    }
+    dispatchNormalized(normalized);
+  };
+
+  const onDecodedMessageBatch = (batch: DecodedZaloWsMessageBatch, header: ZaloWsFrameHeader) => {
+    if (stopped || params.abortSignal.aborted) {
+      return;
+    }
+    const dbg = shouldLogZalouserRawInbound();
+    const normalizedMessages: ZaloInboundMessage[] = [];
+    for (const [index, incoming] of batch.messages.entries()) {
+      if (incoming.isSelf || isLikelyOwnDecodedPageMessage(incoming, ownUserId)) {
+        if (dbg) {
+          writeZalouserInboundDiag(
+            `[zalouser][decoded-inbound-skip-self] source=${batch.source} cmd=${header.cmd} subCmd=${header.subCmd} index=${index} type=${incoming.type} threadId=${incoming.threadId}`,
+          );
+        }
+        continue;
+      }
+      if (dbg) {
+        try {
+          writeZalouserInboundDiag(
+            `[zalouser][decoded-inbound-raw] source=${batch.source} cmd=${header.cmd} subCmd=${header.subCmd} index=${index} type=${incoming.type} threadId=${incoming.threadId} data=${JSON.stringify(
+              incoming.data ?? {},
+            ).slice(0, 8000)}`,
+          );
+        } catch {
+          writeZalouserInboundDiag(
+            `[zalouser][decoded-inbound-raw] source=${batch.source} cmd=${header.cmd} subCmd=${header.subCmd} index=${index} (không serialize được payload)`,
+          );
+        }
+      }
+      const normalized = toInboundMessage(incoming, ownUserId);
+      if (!normalized) {
+        if (dbg) {
+          writeZalouserInboundDiag(
+            `[zalouser][decoded-inbound-drop-null] source=${batch.source} ${explainToInboundNull(
+              incoming,
+              ownUserId,
+            )}`,
+          );
+        }
+        continue;
+      }
+      if (dbg) {
+        writeZalouserInboundDiag(
+          `[zalouser][decoded-inbound-normalized] source=${batch.source} ${summarizeInboundMessageForLog(
+            {
+              message: normalized,
+              directory: directorySnapshot,
+            },
+          )}`,
+        );
+      }
+      normalizedMessages.push(normalized);
+    }
+    const isDecodedOldPageMessages =
+      batch.source === "decoded_pageMsgs" && header.cmd === 510 && header.subCmd === 1;
+    if (isDecodedOldPageMessages && !oldMessagesBaselineSeen.has(ZALO_CHANNEL_THREAD_TYPE)) {
+      oldMessagesBaselineSeen.add(ZALO_CHANNEL_THREAD_TYPE);
+      const replayBaseline = true;
+      if (dbg) {
+        writeZalouserInboundDiag(
+          `[zalouser][decoded-old-messages-baseline] type=channel count=${normalizedMessages.length} replay=${replayBaseline}`,
+        );
+      }
+      if (!replayBaseline) {
+        for (const normalized of normalizedMessages) {
+          const key = resolveInboundDedupeKey(normalized);
+          rememberInboundDedupeKey({ key, seen: seenInboundKeys, order: seenInboundOrder });
+        }
+        return;
+      }
+    }
+    for (const normalized of normalizedMessages) {
+      dispatchNormalized(normalized);
+    }
+  };
+
+  const onOldMessages = (messages: Message[], type: number) => {
+    const dbg = shouldLogZalouserRawInbound();
+    const replayBaseline = true;
+    const normalizedMessages: ZaloInboundMessage[] = [];
+    for (const [index, incoming] of messages.entries()) {
+      if (incoming.isSelf) {
+        continue;
+      }
+      if (dbg) {
+        try {
+          writeZalouserInboundDiag(
+            `[zalouser][old-messages-raw] type=${type} index=${index} data=${JSON.stringify(
+              incoming.data ?? {},
+            ).slice(0, 8000)}`,
+          );
+        } catch {
+          writeZalouserInboundDiag(
+            `[zalouser][old-messages-raw] type=${type} index=${index} (không serialize được payload)`,
+          );
+        }
+      }
+      const normalized = toInboundMessage(incoming, ownUserId);
+      if (!normalized) {
+        if (dbg) {
+          writeZalouserInboundDiag(
+            `[zalouser][old-messages-drop-null] ${explainToInboundNull(incoming, ownUserId)}`,
+          );
+        }
+        continue;
+      }
+      normalizedMessages.push(normalized);
+    }
+    if (dbg) {
+      normalizedMessages.forEach((normalized, index) => {
+        writeZalouserInboundDiag(
+          `[zalouser][old-messages-item] ${summarizeInboundMessageForLog({
+            message: normalized,
+            index,
+            historyType: type,
+            directory: directorySnapshot,
+          })}`,
+        );
+      });
+    }
+    if (!oldMessagesBaselineSeen.has(type)) {
+      oldMessagesBaselineSeen.add(type);
+      if (dbg) {
+        writeZalouserInboundDiag(
+          `[zalouser][old-messages-baseline] type=${
+            type === ThreadType.Group ? "group" : "user"
+          } count=${normalizedMessages.length} replay=${replayBaseline}`,
+        );
+      }
+      if (replayBaseline) {
+        for (const normalized of normalizedMessages) {
+          dispatchNormalized(normalized);
+        }
+        return;
+      }
+      for (const normalized of normalizedMessages) {
+        const key = resolveInboundDedupeKey(normalized);
+        rememberInboundDedupeKey({ key, seen: seenInboundKeys, order: seenInboundOrder });
+      }
+      return;
+    }
+    for (const normalized of normalizedMessages) {
+      dispatchNormalized(normalized);
+    }
   };
 
   const failListener = (error: Error) => {
@@ -1565,15 +2383,62 @@ export async function startZaloListener(params: {
     failListener(new Error(`Zalo listener closed (${code}): ${reason || "no reason"}`));
   };
 
+  const oldMessagesSyncIntervalMs = resolveOldMessagesSyncIntervalMs();
+  const requestOldMessagesForType = (type: number) => {
+    if (
+      stopped ||
+      params.abortSignal.aborted ||
+      oldMessagesSyncIntervalMs <= 0 ||
+      !oldMessagesConnected
+    ) {
+      return;
+    }
+    try {
+      api.listener.requestOldMessages(type);
+    } catch (error) {
+      if (shouldLogZalouserRawInbound()) {
+        writeZalouserInboundDiag(
+          `[zalouser][old-messages-request-error] type=${
+            type === ThreadType.Group ? "group" : "user"
+          } ${toErrorMessage(error)}`,
+        );
+      }
+    }
+  };
+
+  const requestOldMessagesForAllTypes = () => {
+    requestOldMessagesForType(ThreadType.User);
+    requestOldMessagesForType(ThreadType.Group);
+  };
+
+  const onConnected = () => {
+    oldMessagesConnected = true;
+    requestOldMessagesForAllTypes();
+  };
+
+  api.listener.on("connected", onConnected);
   api.listener.on("message", onMessage);
+  api.listener.on("old_messages", onOldMessages);
   api.listener.on("error", onError);
   api.listener.on("closed", onClosed);
 
   try {
     api.listener.start({ retryOnClose: false });
+    detachWsFrameTap = installZaloWsFrameTap(api.listener, profile, onDecodedMessageBatch);
   } catch (error) {
     cleanup();
     throw error;
+  }
+
+  if (shouldLogZalouserRawInbound()) {
+    writeZalouserInboundDiag(
+      `[zalouser][diag] OPENCLAW_ZALOUSER_LOG_RAW_INBOUND=bật — listener Zalo đã start (profile=${profile}). Sẽ có [raw-inbound]/[drop-null] khi có tin từ socket. Nếu không thấy dòng [diag] này sau restart: chạy \`pnpm build\` trong core/openclaw-zero-token rồi ./server.sh restart.`,
+    );
+  }
+
+  if (oldMessagesSyncIntervalMs > 0) {
+    oldMessagesTimer = setInterval(requestOldMessagesForAllTypes, oldMessagesSyncIntervalMs);
+    oldMessagesTimer.unref?.();
   }
 
   watchdogTimer = setInterval(() => {
@@ -1690,4 +2555,30 @@ export async function clearProfileRuntimeArtifacts(profileInput?: string | null)
   }
   invalidateApi(profile);
   await fsp.mkdir(resolveCredentialsDir(), { recursive: true }).catch(() => undefined);
+}
+
+/** Dùng trong Vitest / gỡ lỗi payload OA–card (không bắt buộc cho runtime). */
+export function zalouserNormalizeInboundContentForTest(content: unknown): string {
+  return normalizeZaloInboundTextContent(content);
+}
+
+/** Dùng trong Vitest — map `Message` zca-js → `ZaloInboundMessage`. */
+export function zalouserBuildInboundFromZcaForTest(
+  message: Message,
+  ownUserId?: string,
+): ZaloInboundMessage | null {
+  return toInboundMessage(message, ownUserId);
+}
+
+/** Dùng trong Vitest — đọc header frame WebSocket thô của zca-js. */
+export function zalouserDecodeWsFrameHeaderForTest(data: unknown): ZaloWsFrameHeader | null {
+  return decodeZaloWsFrameHeader(data);
+}
+
+/** Dùng trong Vitest — trích batch tin nhắn đã decode từ frame socket. */
+export function zalouserExtractDecodedWsBatchesForTest(
+  decoded: unknown,
+  options?: ExtractDecodedZaloWsMessageBatchesOptions,
+): DecodedZaloWsMessageBatch[] {
+  return extractDecodedZaloWsMessageBatches(decoded, options);
 }

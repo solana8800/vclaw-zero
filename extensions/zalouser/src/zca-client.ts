@@ -109,14 +109,19 @@ export type LoginQRCallbackEvent =
     };
 
 export type Listener = {
+  on(event: "connected", callback: () => void): void;
   on(event: "message", callback: (message: Message) => void): void;
+  on(event: "old_messages", callback: (messages: Message[], type: number) => void): void;
   on(event: "error", callback: (error: unknown) => void): void;
   on(event: "closed", callback: (code: number, reason: string) => void): void;
+  off(event: "connected", callback: () => void): void;
   off(event: "message", callback: (message: Message) => void): void;
+  off(event: "old_messages", callback: (messages: Message[], type: number) => void): void;
   off(event: "error", callback: (error: unknown) => void): void;
   off(event: "closed", callback: (code: number, reason: string) => void): void;
   start(opts?: { retryOnClose?: boolean }): void;
   stop(): void;
+  requestOldMessages(type: number, lastMsgId?: string | null): void;
 };
 
 type DeliveryEventMessage = {
@@ -254,6 +259,6 @@ export async function createZalo(
   options?: ConstructorParameters<ZaloCtor>[0],
 ): Promise<InstanceType<ZaloCtor>> {
   const zcaJs = await loadZcaJsRuntime();
-  const Zalo = zcaJs.Zalo as unknown as ZaloCtor;
+  const Zalo = zcaJs.Zalo as ZaloCtor;
   return new Zalo(options);
 }

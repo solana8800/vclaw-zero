@@ -19,6 +19,43 @@ OpenClaw extension for Zalo Personal Account messaging via native `zca-js` integ
 
 No external `zca`, `openzca`, or `zca-cli` binary is required.
 
+## Nhận tin từ OA / kênh (Techcombank, ngân hàng…)
+
+Plugin hỗ trợ nhận tin từ Zalo OA/Page/kênh (type ≠ User/Group) theo hai cơ chế song song, **luôn bật**, không cần cấu hình thêm:
+
+| Cơ chế                | Mô tả                                                                                                                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **WS frame tap**      | Tap thẳng vào socket raw của `zca-js`, decode frame OA (cmd=501/510…) realtime. Bắt được tin ngay khi gửi đến.                                                                 |
+| **old_messages poll** | Gọi `requestOldMessages` mỗi 15 giây sau khi WebSocket `connected`. Bắt được tin bị rơi vào lịch sử (offline, missed). Batch đầu tiên khi start luôn được replay vào pipeline. |
+
+Thời gian chỉnh poll interval: `OPENCLAW_ZALOUSER_OLD_MESSAGES_SYNC_MS` (ms, mặc định 15000; đặt `0` để tắt polling).
+
+## Debug OA / kênh
+
+Raw log **mặc định tắt**. Bật khi cần chẩn đoán:
+
+```bash
+OPENCLAW_ZALOUSER_LOG_RAW_INBOUND=1 ./server.sh start
+```
+
+Khi bật, trên **stderr** của gateway sẽ thấy:
+
+- `[zalouser][diag]` — xác nhận listener đã start và debug đang bật.
+- `[zalouser][raw-inbound]` — payload `message.data` mỗi khi socket nhận tin.
+- `[zalouser][ws-frame]` / `[zalouser][ws-frame-decoded]` — frame WebSocket thô và nội dung sau decode.
+- `[zalouser][inbound-normalized]` — tin đã parse xong, kèm `conversationKind`: `friend` / `group` / `channel_candidate`.
+- `[zalouser][skip-self]` — tin bị coi là `isSelf`, bỏ qua.
+- `[zalouser][drop-null]` — tin không parse được (thiếu `threadId`/`senderId`); kèm JSON gợi ý field thô.
+- `[zalouser][old-messages-item]` — từng tin lịch sử, kèm `senderName`, `msgType`, `msgId`, `preview`.
+
+Grep nhanh để tìm tin kênh/OA:
+
+```bash
+grep 'channel_candidate' /tmp/openclaw-upstream-gateway.log
+```
+
+**Sau khi sửa mã trong `extensions/zalouser/src`:** phải chạy `pnpm build` ở thư mục gốc `openclaw-zero-token`, rồi `./server.sh restart` để gateway chạy từ bản build mới.
+
 ## Install
 
 ### Option A: npm

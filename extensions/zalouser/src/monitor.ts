@@ -70,6 +70,8 @@ export type ZalouserMonitorResult = {
 const ZALOUSER_TEXT_LIMIT = 2000;
 
 const VCLAW_ENRICH_DEFAULT_URL = "http://127.0.0.1:12687/api/vclaw/enrich";
+const VCLAW_CHANNEL_NOTIFICATION_DEFAULT_URL =
+  "http://127.0.0.1:12687/api/vclaw/channel-notification";
 const VCLAW_ENRICH_TIMEOUT_MS = 1_500;
 
 function isTruthyEnv(value: string | undefined): boolean {
@@ -100,6 +102,44 @@ function resolveVclawEnrichUrl(): string {
     process.env.VCLAW_ENRICH_URL?.trim() ||
     VCLAW_ENRICH_DEFAULT_URL
   );
+}
+
+function resolveVclawChannelNotificationUrl(): string {
+  return (
+    process.env.VCLAW_CHANNEL_NOTIFICATION_URL?.trim() || VCLAW_CHANNEL_NOTIFICATION_DEFAULT_URL
+  );
+}
+
+async function recordZalouserChannelNotification(params: {
+  rawBody: string;
+  threadId: string;
+  senderName: string;
+  msgType?: string | null;
+  msgId?: string | null;
+  runtime: RuntimeEnv;
+}): Promise<void> {
+  const url = resolveVclawChannelNotificationUrl();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), VCLAW_ENRICH_TIMEOUT_MS);
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        channel: "zalo",
+        threadId: params.threadId,
+        senderName: params.senderName,
+        rawBody: params.rawBody,
+        msgType: params.msgType ?? null,
+        msgId: params.msgId ?? null,
+      }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    params.runtime.error?.(`zalouser: channel notification record failed: ${String(err)}`);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 type VclawEnrichDecision = {
@@ -281,6 +321,69 @@ function resolveZalouserInboundSessionKey(params: {
   return hasLegacySession && !hasDirectSession ? legacySessionKey : directSessionKey;
 }
 
+function stringFieldFromRecord(obj: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const v = obj[key];
+    if (typeof v === "string" && v.trim()) {
+      return v.trim();
+    }
+    if (typeof v === "number" && Number.isFinite(v)) {
+      return String(v);
+    }
+  }
+  return "";
+}
+
+function resolveZaloInboundRawData(message: ZaloInboundMessage): Record<string, unknown> | null {
+  const raw = message.raw;
+  if (Array.isArray(raw)) {
+    for (let i = raw.length - 1; i >= 0; i -= 1) {
+      const entry = raw[i];
+      if (entry && typeof entry === "object" && "data" in entry) {
+        const data = (entry as { data?: unknown }).data;
+        if (data && typeof data === "object" && !Array.isArray(data)) {
+          return data as Record<string, unknown>;
+        }
+      }
+    }
+    return null;
+  }
+  if (raw && typeof raw === "object" && "data" in raw) {
+    const data = (raw as { data?: unknown }).data;
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      return data as Record<string, unknown>;
+    }
+  }
+  return null;
+}
+
+function buildSyntheticZaloBodyWhenNoText(message: ZaloInboundMessage): string {
+  const hasSignal =
+    Boolean(message.msgId?.trim()) ||
+    Boolean(message.cliMsgId?.trim()) ||
+    Boolean(message.eventMessage);
+  if (!hasSignal) {
+    return "";
+  }
+  const data = resolveZaloInboundRawData(message);
+  const msgType =
+    message.msgType?.trim() ||
+    stringFieldFromRecord(data ?? {}, ["msgType"]) ||
+    message.eventMessage?.msgType ||
+    "unknown";
+  const parts = ["[Tin Zalo không có nội dung text]", `msgType=${msgType}`];
+  if (message.msgId?.trim()) {
+    parts.push(`msgId=${message.msgId.trim()}`);
+  }
+  if (message.cliMsgId?.trim()) {
+    parts.push(`cliMsgId=${message.cliMsgId.trim()}`);
+  }
+  if (message.senderName?.trim()) {
+    parts.push(`from=${message.senderName.trim()}`);
+  }
+  return parts.join(" ");
+}
+
 function logVerbose(core: ZalouserCoreRuntime, runtime: RuntimeEnv, message: string): void {
   if (core.logging.shouldLogVerbose()) {
     runtime.log(`[zalouser] ${message}`);
@@ -356,13 +459,17 @@ async function processMessage(
     accountId: account.accountId,
   });
 
-  const rawBody = message.content?.trim();
+  let rawBody = message.content?.trim();
+  if (!rawBody) {
+    rawBody = buildSyntheticZaloBodyWhenNoText(message).trim();
+  }
   if (!rawBody) {
     return;
   }
   const commandBody = message.commandContent?.trim() || rawBody;
 
   const isGroup = message.isGroup;
+  const isChannel = message.isChannel ?? false;
   const chatId = message.threadId;
   const senderId = message.senderId?.trim();
   if (!senderId) {
@@ -371,6 +478,25 @@ async function processMessage(
   }
 
   const senderName = message.senderName ?? "";
+  const conversationKind = isGroup ? "group" : isChannel ? "channel" : "friend";
+  runtime.log?.(
+    `[${account.accountId}] zalouser [${conversationKind}] từ: ${senderName || senderId}`,
+  );
+
+  // Tin từ kênh/OA (Techcombank, ngân hàng…): ghi nhận thông báo, không đưa vào AI.
+  // Nếu trả lời sẽ tạo vòng lặp vô hạn (bot ↔ kênh bot).
+  if (isChannel) {
+    void recordZalouserChannelNotification({
+      rawBody,
+      threadId: chatId,
+      senderName,
+      msgType: message.msgType ?? null,
+      msgId: message.msgId ?? null,
+      runtime,
+    });
+    return;
+  }
+
   const configuredGroupName = message.groupName?.trim() || "";
   const groupContext =
     isGroup && !configuredGroupName
