@@ -2276,19 +2276,16 @@ export async function startZaloListener(params: {
       batch.source === "decoded_pageMsgs" && header.cmd === 510 && header.subCmd === 1;
     if (isDecodedOldPageMessages && !oldMessagesBaselineSeen.has(ZALO_CHANNEL_THREAD_TYPE)) {
       oldMessagesBaselineSeen.add(ZALO_CHANNEL_THREAD_TYPE);
-      const replayBaseline = true;
       if (dbg) {
         writeZalouserInboundDiag(
-          `[zalouser][decoded-old-messages-baseline] type=channel count=${normalizedMessages.length} replay=${replayBaseline}`,
+          `[zalouser][decoded-old-messages-baseline] type=channel count=${normalizedMessages.length} replay=false (startup-skip)`,
         );
       }
-      if (!replayBaseline) {
-        for (const normalized of normalizedMessages) {
-          const key = resolveInboundDedupeKey(normalized);
-          rememberInboundDedupeKey({ key, seen: seenInboundKeys, order: seenInboundOrder });
-        }
-        return;
+      for (const normalized of normalizedMessages) {
+        const key = resolveInboundDedupeKey(normalized);
+        rememberInboundDedupeKey({ key, seen: seenInboundKeys, order: seenInboundOrder });
       }
+      return;
     }
     for (const normalized of normalizedMessages) {
       dispatchNormalized(normalized);
@@ -2297,7 +2294,6 @@ export async function startZaloListener(params: {
 
   const onOldMessages = (messages: Message[], type: number) => {
     const dbg = shouldLogZalouserRawInbound();
-    const replayBaseline = true;
     const normalizedMessages: ZaloInboundMessage[] = [];
     for (const [index, incoming] of messages.entries()) {
       if (incoming.isSelf) {
@@ -2345,14 +2341,8 @@ export async function startZaloListener(params: {
         writeZalouserInboundDiag(
           `[zalouser][old-messages-baseline] type=${
             type === ThreadType.Group ? "group" : "user"
-          } count=${normalizedMessages.length} replay=${replayBaseline}`,
+          } count=${normalizedMessages.length} replay=false (startup-skip)`,
         );
-      }
-      if (replayBaseline) {
-        for (const normalized of normalizedMessages) {
-          dispatchNormalized(normalized);
-        }
-        return;
       }
       for (const normalized of normalizedMessages) {
         const key = resolveInboundDedupeKey(normalized);
