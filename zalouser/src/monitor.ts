@@ -122,7 +122,7 @@ async function recordZalouserChannelNotification(params: {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), VCLAW_ENRICH_TIMEOUT_MS);
   try {
-    await fetch(url, {
+    const response = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -135,6 +135,22 @@ async function recordZalouserChannelNotification(params: {
       }),
       signal: controller.signal,
     });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      params.runtime.error?.(
+        `zalouser: channel notification record failed: HTTP ${response.status} ${text.slice(0, 500)}`,
+      );
+      return;
+    }
+    const result = (await response.json().catch(() => null)) as {
+      id?: unknown;
+      duplicate?: unknown;
+    } | null;
+    params.runtime.log?.(
+      `zalouser: đã lưu thông báo kênh ${params.senderName || params.threadId}${
+        typeof result?.id === "string" ? ` (${result.id})` : result?.duplicate ? " (trùng)" : ""
+      }`,
+    );
   } catch (err) {
     params.runtime.error?.(`zalouser: channel notification record failed: ${String(err)}`);
   } finally {
@@ -486,7 +502,7 @@ async function processMessage(
   // Tin từ kênh/OA (Techcombank, ngân hàng…): ghi nhận thông báo, không đưa vào AI.
   // Nếu trả lời sẽ tạo vòng lặp vô hạn (bot ↔ kênh bot).
   if (isChannel) {
-    void recordZalouserChannelNotification({
+    await recordZalouserChannelNotification({
       rawBody,
       threadId: chatId,
       senderName,
