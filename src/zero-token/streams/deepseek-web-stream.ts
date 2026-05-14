@@ -81,7 +81,13 @@ export function createDeepseekWebStreamFn(cookieOrJson: string): StreamFn {
           let systemPromptContent = systemPrompt;
 
           if (tools.length > 0) {
-            let toolPrompt = "\n## Available Tools\n";
+            let toolPrompt =
+              "\n## Tool Calling Instructions\n" +
+              "When you need to call a tool, output ONLY this XML format — no other text before it:\n" +
+              '<tool_call name="TOOL_NAME">{"arg1": "value1"}</tool_call>\n' +
+              "Wait for the <tool_response> before continuing. You may call multiple tools in sequence.\n" +
+              "NEVER describe what you are about to do — just call the tool immediately.\n\n" +
+              "## Available Tools\n";
             for (const tool of tools) {
               toolPrompt += `- ${tool.name}: ${tool.description}\n`;
             }
