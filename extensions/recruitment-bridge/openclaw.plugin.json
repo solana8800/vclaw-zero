@@ -1,0 +1,12 @@
+{
+  "id": "recruitment-bridge",
+  "name": "Recruitment Skills Bridge",
+  "description": "Bridges recruitment skills (smart-linkedin-inbox, head-hunter) as Gateway Tools.",
+  "version": "1.0.0",
+  "capabilities": ["tools"],
+  "main": "./index.ts",
+  "configSchema": {
+    "type": "object",
+    "properties": {}
+  }
+}

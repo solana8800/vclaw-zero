@@ -1144,9 +1144,14 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
           });
         }
       }
-      registry.plugins.push(record);
-      seenIds.set(pluginId, candidate.origin);
-      continue;
+
+      // Allow bundles with 'skills' capability to proceed to registration
+      // so they can be exposed as tools.
+      if (!(record.bundleCapabilities ?? []).includes("skills")) {
+        registry.plugins.push(record);
+        seenIds.set(pluginId, candidate.origin);
+        continue;
+      }
     }
     // Fast-path bundled memory plugins that are guaranteed disabled by slot policy.
     // This avoids opening/importing heavy memory plugin modules that will never register.
