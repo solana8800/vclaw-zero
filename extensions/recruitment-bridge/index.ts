@@ -66,8 +66,8 @@ export default {
     api.registerTool(() => ({
       name: "head-hunter",
       description:
-        "Tìm kiếm ứng viên và đăng việc làm trên LinkedIn bằng trình duyệt thật (CDP/Playwright). " +
-        "Kết quả tự động lưu vào VClaw DB.",
+        "Tìm kiếm ứng viên và đăng bài marketing LinkedIn (feed + ảnh đính kèm tùy chọn) qua CDP. " +
+        "Chỉ feed cá nhân / Company Page — không Job Post trả phí.",
       parameters: {
         type: "object",
         properties: {
@@ -77,7 +77,7 @@ export default {
               "search",
               "get_profile",
               "send_message",
-              "create_job_post",
+              "create_feed_post",
               "open_browser",
               "get_session",
               "save_session",
@@ -88,13 +88,22 @@ export default {
           profile_url: { type: "string", description: "URL profile để gửi tin nhắn" },
           message: { type: "string", description: "Nội dung tin nhắn" },
           jobPositionId: { type: "string", description: "ID vị trí trong VClaw DB" },
-          // --- Dùng cho create_job_post ---
-          title: { type: "string", description: "Tiêu đề vị trí tuyển dụng" },
-          description: { type: "string", description: "Mô tả công việc" },
-          location: { type: "string", description: "Địa điểm (vd: Ho Chi Minh, Vietnam)" },
+          // --- Đăng bài marketing (feed / company page) ---
+          title: { type: "string", description: "Dòng tiêu đề / hook bài đăng" },
+          description: { type: "string", description: "Nội dung bài marketing" },
+          target: {
+            type: "string",
+            enum: ["personal", "company"],
+            description: "personal = feed tài khoản đang đăng nhập; company = Company Page",
+          },
           companyUrl: {
             type: "string",
-            description: "URL Company Page LinkedIn (nếu đăng cho công ty)",
+            description:
+              "Link Company Page (bắt buộc khi target=company). VD: https://www.linkedin.com/company/117543969/ hoặc /company/ten-page/",
+          },
+          imagePath: {
+            type: "string",
+            description: "Đường dẫn file ảnh PNG/JPEG local để đính kèm bài feed",
           },
         },
         required: ["action"],
@@ -125,16 +134,26 @@ export default {
           case "linkedin_send_message":
             scriptArgs.push("send_message", "--url", args.profile_url, "--message", args.message);
             break;
-          case "create_job_post":
+          case "create_feed_post": {
+            const postTarget =
+              args.target === "company" || args.target === "personal"
+                ? args.target
+                : args.companyUrl
+                  ? "company"
+                  : "personal";
             scriptArgs.push(
-              "create_job_post",
-              "--title",
-              args.title,
+              "create_feed_post",
+              ...(args.title ? ["--title", args.title] : []),
               ...(args.description ? ["--description", args.description] : []),
-              ...(args.location ? ["--location", args.location] : []),
-              ...(args.companyUrl ? ["--company-url", args.companyUrl] : []),
+              "--target",
+              postTarget,
+              ...(postTarget === "company" && args.companyUrl
+                ? ["--company-url", args.companyUrl]
+                : []),
+              ...(args.imagePath ? ["--image-path", args.imagePath] : []),
             );
             break;
+          }
           case "get_session":
             scriptArgs.push("get_session");
             break;
@@ -151,26 +170,17 @@ export default {
           args: scriptArgs,
         });
 
-        // Sau tìm kiếm → tự đẩy ứng viên về VClaw DB
-        if (action === "linkedin_search" && result.success && Array.isArray(result.data)) {
-          const validCandidates = result.data.filter((c: any) => c.profile_url?.includes("/in/"));
-          if (validCandidates.length > 0) {
-            await pushToVClaw("sync_candidates", {
-              candidates: validCandidates,
-              jobPositionId: jobPositionId ?? null,
-            });
-          }
-        }
-
         // Sau đăng bài thành công → lưu vào DB
-        if (action === "create_job_post" && result.success) {
+        if (action === "create_feed_post" && result.success) {
           const postData = typeof result.data === "object" ? result.data : {};
           if (postData.success) {
             await pushToVClaw("save_job_post", {
               jobPositionId: jobPositionId ?? null,
-              title: args.title,
-              linkedinJobUrl: postData.jobUrl ?? null,
-              companyUrl: args.companyUrl ?? null,
+              title: args.title ?? null,
+              linkedinJobUrl: postData.postUrl ?? postData.jobUrl ?? null,
+              companyUrl: postData.companyUrl ?? args.companyUrl ?? null,
+              target: postData.target ?? args.target ?? null,
+              hasImage: Boolean(postData.imageAttached ?? args.imagePath),
             });
           }
         }
@@ -213,7 +223,9 @@ export default {
 
       async execute(_toolCallId: string, params: any) {
         const { action, ...args } = params;
-        const token = process.env.LINXA_TOKEN;
+        const token =
+          (typeof args.linxaToken === "string" && args.linxaToken.trim()) ||
+          process.env.LINXA_TOKEN;
         if (!token) throw new Error("Thiếu LINXA_TOKEN trong môi trường.");
 
         const base = "https://app.uselinxa.com";
