@@ -77,6 +77,8 @@ export default {
               "search",
               "get_profile",
               "send_message",
+              "send_connect",
+              "linkedin_send_connect",
               "create_feed_post",
               "open_browser",
               "get_session",
@@ -87,6 +89,7 @@ export default {
           url: { type: "string", description: "URL profile LinkedIn" },
           profile_url: { type: "string", description: "URL profile để gửi tin nhắn" },
           message: { type: "string", description: "Nội dung tin nhắn" },
+          note: { type: "string", description: "Ghi chú kèm lời mời kết nối LinkedIn" },
           jobPositionId: { type: "string", description: "ID vị trí trong VClaw DB" },
           // --- Đăng bài marketing (feed / company page) ---
           title: { type: "string", description: "Dòng tiêu đề / hook bài đăng" },
@@ -133,6 +136,15 @@ export default {
           case "send_message":
           case "linkedin_send_message":
             scriptArgs.push("send_message", "--url", args.profile_url, "--message", args.message);
+            break;
+          case "send_connect":
+          case "linkedin_send_connect":
+            scriptArgs.push(
+              "send_connect",
+              "--url",
+              args.profile_url || args.url,
+              ...(args.note || args.message ? ["--message", args.note || args.message] : []),
+            );
             break;
           case "create_feed_post": {
             const postTarget =

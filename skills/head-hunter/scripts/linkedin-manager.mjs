@@ -15,6 +15,15 @@ import path from "path";
  * Biến môi trường: LINKEDIN_CDP_URL (mặc định http://127.0.0.1:9222)
  */
 import { chromium } from "playwright-core";
+import {
+  linkedInConnectButtonName,
+  linkedInConnectLabelFragment,
+  linkedInMessageButtonName,
+  linkedInMoreButtonName,
+  linkedInPendingButtonName,
+  linkedInProfileActionElementSelector,
+  linkedInSendInvitationButtonName,
+} from "./linkedin-action-selectors.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SESSION_FILE = path.join(os.homedir(), ".openclaw", "workspace", "linkedin-session.json");
@@ -119,6 +128,48 @@ function buildMarketingPostText(title, description) {
   if (title?.trim()) parts.push(title.trim());
   if (description?.trim()) parts.push(description.trim());
   return parts.join("\n\n");
+}
+
+function profileAction(page, name) {
+  return page.getByRole("button", { name }).or(page.getByRole("link", { name })).first();
+}
+
+function connectActionFallback(page) {
+  return page
+    .locator(
+      [
+        'button[aria-label^="Connect"]',
+        'button[aria-label^="Kết nối"]',
+        'button[aria-label*=" to connect" i]',
+        'button[aria-label*="kết nối" i]',
+        'a[aria-label^="Connect"]',
+        'a[aria-label^="Kết nối"]',
+        'a[aria-label*=" to connect" i]',
+        'a[aria-label*="kết nối" i]',
+        'div[role="button"][aria-label^="Connect"]',
+        'div[role="button"][aria-label^="Kết nối"]',
+        'div[role="button"][aria-label*=" to connect" i]',
+        'div[role="button"][aria-label*="kết nối" i]',
+      ].join(", "),
+    )
+    .first();
+}
+
+function profileTextActionFallback(page, name) {
+  return page.locator(linkedInProfileActionElementSelector).filter({ hasText: name }).first();
+}
+
+function messageActionFallback(page) {
+  return page
+    .locator(
+      [
+        'button[aria-label^="Message"]',
+        'button[aria-label^="Nhắn tin"]',
+        'a[aria-label^="Message"]',
+        'a[aria-label^="Nhắn tin"]',
+      ].join(", "),
+    )
+    .first();
 }
 
 /** Modal soạn bài đăng (không phải ô comment trên feed). */
@@ -366,6 +417,11 @@ async function clickPublishPost(page) {
 // ============================================================
 // 1. Tìm kiếm ứng viên
 // ============================================================
+const LINKEDIN_SEARCH_MAX = Math.min(
+  Math.max(Number(process.env.LINKEDIN_SEARCH_MAX || 10) || 10, 1),
+  25,
+);
+
 async function linkedinSearch(query, cdpUrl) {
   console.error(`--- Đang tìm kiếm ứng viên với từ khóa: '${query}' ---`);
   const { browser, page } = await connectPage(cdpUrl);
@@ -408,7 +464,7 @@ async function linkedinSearch(query, cdpUrl) {
     const seen = new Set();
     const results = [];
     for (const sel of selectors) {
-      if (results.length >= 5) break;
+      if (results.length >= LINKEDIN_SEARCH_MAX) break;
       try {
         let nameEl = sel.locator(".entity-result__title-text a, .actor-name").first();
         if (!(await nameEl.count())) nameEl = sel.locator("a[href*='/in/']").first();
@@ -631,11 +687,13 @@ async function linkedinGetProfile(url, cdpUrl) {
 
       let connectionStatus = "UNKNOWN";
       try {
-        const connectBtn = page.getByRole("button", { name: /^(Connect|Kết nối)$/i }).first();
-        const pendingBtn = page
-          .getByRole("button", { name: /^(Pending|Đang chờ|Đã gửi)$/i })
+        const connectBtn = profileAction(page, linkedInConnectButtonName)
+          .or(connectActionFallback(page))
           .first();
-        const messageBtn = page.getByRole("button", { name: /^(Message|Nhắn tin)$/i }).first();
+        const pendingBtn = page.getByRole("button", { name: linkedInPendingButtonName }).first();
+        const messageBtn = profileAction(page, linkedInMessageButtonName)
+          .or(messageActionFallback(page))
+          .first();
         if (await messageBtn.isVisible().catch(() => false)) {
           connectionStatus = "CONNECTED";
         } else if (await pendingBtn.isVisible().catch(() => false)) {
@@ -806,7 +864,170 @@ async function linkedinCreateFeedPost({
 }
 
 // ============================================================
-// 4. Gửi tin nhắn LinkedIn (CDP)
+// 4. Gửi lời mời kết nối LinkedIn (CDP) — kèm ghi chú tùy chọn (tối đa 300 ký tự)
+// ============================================================
+async function clickConnectOnProfile(page) {
+  const direct = profileAction(page, linkedInConnectButtonName)
+    .or(connectActionFallback(page))
+    .or(profileTextActionFallback(page, linkedInConnectLabelFragment))
+    .first();
+  if (await direct.isVisible({ timeout: 4000 }).catch(() => false)) {
+    await direct.click();
+    return true;
+  }
+  const moreBtn = page
+    .getByRole("button", { name: linkedInMoreButtonName })
+    .or(page.locator('button[aria-label^="More"], button[aria-label^="Thêm"]'))
+    .first();
+  if (await moreBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await moreBtn.click();
+    await sleep(800);
+    const menuConnect = page
+      .getByRole("menuitem", { name: linkedInConnectButtonName })
+      .or(page.getByRole("button", { name: linkedInConnectButtonName }))
+      .or(page.getByRole("link", { name: linkedInConnectButtonName }))
+      .or(page.getByRole("menuitem", { name: linkedInConnectLabelFragment }))
+      .or(page.getByRole("button", { name: linkedInConnectLabelFragment }))
+      .or(page.getByRole("link", { name: linkedInConnectLabelFragment }))
+      .or(connectActionFallback(page))
+      .or(profileTextActionFallback(page, linkedInConnectLabelFragment))
+      .first();
+    if (await menuConnect.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await menuConnect.click();
+      return true;
+    }
+  }
+  return false;
+}
+
+async function fillConnectNoteModal(page, note) {
+  const trimmed = (note || "").trim().slice(0, 300);
+  if (!trimmed) return true;
+
+  const addNote = page.getByRole("button", { name: /Add a note|Thêm ghi chú|Add note/i }).first();
+  if (await addNote.isVisible({ timeout: 4000 }).catch(() => false)) {
+    await addNote.click();
+    await sleep(600);
+  }
+
+  const textarea = page
+    .locator(
+      'textarea[name="message"], textarea#custom-message, textarea[aria-label*="note"], textarea[aria-label*="ghi chú"]',
+    )
+    .first();
+  if (await textarea.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await textarea.fill(trimmed);
+    return true;
+  }
+
+  const editable = page
+    .locator(
+      '[data-test-modal] [contenteditable="true"], div[role="dialog"] [contenteditable="true"]',
+    )
+    .first();
+  if (await editable.count()) {
+    await editable.click({ force: true }).catch(() => {});
+    await page.keyboard.insertText(trimmed).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
+async function clickSendInvitation(page) {
+  const scopes = [
+    page.getByRole("button", { name: linkedInSendInvitationButtonName }),
+    page.locator('button[aria-label*="Send invitation"], button[aria-label*="Gửi lời mời"]'),
+  ];
+  for (const btn of scopes) {
+    const loc = btn.first();
+    if (await loc.isVisible({ timeout: 2500 }).catch(() => false)) {
+      if (await loc.isEnabled().catch(() => false)) {
+        await loc.click();
+        await sleep(2000);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+async function linkedinSendConnect(url, note, cdpUrl) {
+  console.error(`--- Gửi lời mời kết nối LinkedIn: ${url} ---`);
+  let profileUrl = (url || "").split("?")[0];
+  if (!profileUrl.includes("/in/")) {
+    return { success: false, error: "URL profile không hợp lệ." };
+  }
+  if (!profileUrl.startsWith("http")) {
+    profileUrl = `https://www.linkedin.com${profileUrl}`;
+  }
+
+  const { browser, page } = await connectPage(cdpUrl);
+  try {
+    await page.goto(profileUrl, { timeout: 60_000 });
+    await page.waitForLoadState("domcontentloaded").catch(() => null);
+    await sleep(2000);
+
+    const currentUrl = page.url();
+    if (currentUrl.includes("login") || currentUrl.includes("authwall")) {
+      return { success: false, error: "Chưa đăng nhập LinkedIn trên Chrome CDP." };
+    }
+
+    const pendingBtn = page.getByRole("button", { name: linkedInPendingButtonName }).first();
+    if (await pendingBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      return {
+        success: false,
+        error: "Đã gửi lời mời kết nối trước đó — đang chờ ứng viên chấp nhận.",
+        connectionStatus: "PENDING",
+      };
+    }
+
+    const messageBtn = page
+      .getByRole("button", { name: linkedInMessageButtonName })
+      .or(page.getByRole("link", { name: linkedInMessageButtonName }))
+      .or(messageActionFallback(page))
+      .first();
+    if (await messageBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      return {
+        success: false,
+        error: "Đã kết nối với ứng viên — dùng Gửi tin nhắn thay vì kết bạn.",
+        connectionStatus: "CONNECTED",
+      };
+    }
+
+    const clicked = await clickConnectOnProfile(page);
+    if (!clicked) {
+      return { success: false, error: "Không thấy nút Kết nối trên profile." };
+    }
+    await sleep(1500);
+
+    if (note?.trim()) {
+      const filled = await fillConnectNoteModal(page, note);
+      if (!filled) {
+        console.error("⚠️ Không điền được ghi chú — thử gửi không kèm note.");
+      }
+    }
+
+    const sent = await clickSendInvitation(page);
+    if (!sent) {
+      return { success: false, error: "Không nhấn được Gửi lời mời — kiểm tra popup LinkedIn." };
+    }
+
+    return {
+      success: true,
+      recipient: profileUrl,
+      note_preview: (note || "").trim().slice(0, 80),
+      connectionStatus: "PENDING",
+      note: "Đã gửi lời mời kết nối trên LinkedIn.",
+    };
+  } catch (e) {
+    return { success: false, error: `Lỗi gửi lời mời: ${e.message}` };
+  } finally {
+    await releaseCdpBrowser(browser);
+  }
+}
+
+// ============================================================
+// 5. Gửi tin nhắn LinkedIn (CDP)
 // ============================================================
 function msgComposerEditor(page) {
   return page
@@ -832,23 +1053,15 @@ async function fillMessageComposer(page, text) {
   }
   if (!(await editor.count())) return false;
 
-  const filled = await editor
-    .evaluate((el, content) => {
-      if (!el || !content) return false;
-      el.focus();
-      el.innerHTML = "";
-      el.textContent = content;
-      el.dispatchEvent(new InputEvent("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return (el.textContent || "").trim().length >= Math.min(5, content.length);
-    }, text)
-    .catch(() => false);
-
-  if (filled) return true;
-
   await editor.click({ force: true }).catch(() => {});
-  await sleep(300);
+  await sleep(500);
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
+  await page.keyboard.press("Backspace").catch(() => {});
+  await sleep(200);
+
   await page.keyboard.insertText(text).catch(() => {});
+  await sleep(800);
+
   const after = await editor.innerText().catch(() => "");
   return after.trim().length >= Math.min(5, text.length);
 }
@@ -863,12 +1076,43 @@ async function clickSendMessage(page) {
     const loc = btn.first();
     if (await loc.isVisible({ timeout: 2000 }).catch(() => false)) {
       if (await loc.isEnabled().catch(() => false)) {
-        await loc.click();
+        await loc.click({ force: true });
         await sleep(1500);
         return true;
       }
     }
   }
+
+  // Fallback: Force click bằng JS thuần
+  const clickedViaEval = await page
+    .evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button[type="submit"]'));
+      const sendBtn = btns.find((b) => {
+        const text = (b.innerText || b.textContent || "").trim().toLowerCase();
+        return text === "send" || text === "gửi";
+      });
+      if (sendBtn && !sendBtn.disabled) {
+        sendBtn.click();
+        return true;
+      }
+
+      // Tìm nút chính trong form gửi
+      const formBtns = Array.from(
+        document.querySelectorAll("form.msg-form button.artdeco-button--primary"),
+      );
+      if (formBtns.length > 0 && !formBtns[0].disabled) {
+        formBtns[0].click();
+        return true;
+      }
+      return false;
+    })
+    .catch(() => false);
+
+  if (clickedViaEval) {
+    await sleep(1500);
+    return true;
+  }
+
   return false;
 }
 
@@ -893,24 +1137,77 @@ async function linkedinSendMessage(url, message, cdpUrl) {
       return { success: false, error: "Chưa đăng nhập LinkedIn trên Chrome CDP." };
     }
 
-    const connectBtn = page.getByRole("button", { name: /^(Connect|Kết nối)$/i }).first();
-    const messageBtn = page
-      .getByRole("button", { name: /^(Message|Nhắn tin)$/i })
-      .or(page.getByRole("link", { name: /^(Message|Nhắn tin)$/i }))
+    const connectBtn = profileAction(page, linkedInConnectButtonName)
+      .or(connectActionFallback(page))
       .first();
+    // Resilient search and click for Message button
+    let clickedMessage = false;
+    for (let i = 0; i < 3; i++) {
+      clickedMessage = await page
+        .evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+          const msgBtn = btns.find((b) => {
+            const text = (b.innerText || b.textContent || "").trim().toLowerCase();
+            return (
+              text === "message" ||
+              text === "nhắn tin" ||
+              text.startsWith("message ") ||
+              text.startsWith("nhắn tin ")
+            );
+          });
+          if (msgBtn) {
+            msgBtn.click();
+            return true;
+          }
+          return false;
+        })
+        .catch(() => false);
 
-    if (!(await messageBtn.isVisible({ timeout: 12_000 }).catch(() => false))) {
-      if (await connectBtn.isVisible().catch(() => false)) {
+      if (clickedMessage) break;
+
+      // If not found, try to open the "More" menu and wait a bit before retrying
+      if (i === 0) {
+        await page
+          .evaluate(() => {
+            const moreBtns = Array.from(document.querySelectorAll("button, a"));
+            const moreBtn = moreBtns.find((b) => {
+              const t = (b.innerText || b.getAttribute("aria-label") || "").trim().toLowerCase();
+              return (
+                t === "more" || t === "thêm" || t === "more actions" || t === "các hành động khác"
+              );
+            });
+            if (moreBtn) moreBtn.click();
+          })
+          .catch(() => {});
+      }
+      await sleep(1500);
+    }
+
+    if (!clickedMessage) {
+      const isPending = await page
+        .evaluate(() => {
+          return Array.from(document.querySelectorAll("button, a")).some((b) => {
+            const t = (b.innerText || "").trim().toLowerCase();
+            return t === "pending" || t === "đang chờ" || t === "đã gửi";
+          });
+        })
+        .catch(() => false);
+
+      if (isPending) {
         return {
           success: false,
           error:
-            "Chưa kết nối với ứng viên — không có nút Nhắn tin. Gửi lời mời kết nối trên LinkedIn trước.",
+            "Ứng viên chưa chấp nhận lời mời (Đang chờ) và không có nút Nhắn tin (Premium/Open Profile).",
         };
       }
-      return { success: false, error: "Không thấy nút Nhắn tin trên profile." };
+
+      return {
+        success: false,
+        error:
+          "Không tìm thấy nút 'Nhắn tin' (Message) trên profile. Có thể bạn chưa kết nối với ứng viên này trên LinkedIn, hoặc giao diện LinkedIn đã thay đổi.",
+      };
     }
 
-    await messageBtn.click();
     await sleep(3500);
 
     if (!(await fillMessageComposer(page, message))) {
@@ -919,6 +1216,8 @@ async function linkedinSendMessage(url, message, cdpUrl) {
 
     let sent = await clickSendMessage(page);
     if (!sent) {
+      await page.keyboard.press("Enter").catch(() => {});
+      await sleep(500);
       await page.keyboard.press("Control+Enter").catch(() => {});
       await page.keyboard.press("Meta+Enter").catch(() => {});
       await sleep(1200);
@@ -999,6 +1298,7 @@ async function main() {
     "search",
     "get_profile",
     "send_message",
+    "send_connect",
     "create_feed_post",
     "open_browser",
     "get_session",
@@ -1027,6 +1327,12 @@ async function main() {
         process.exit(1);
       }
       console.log(JSON.stringify(await linkedinSendMessage(url, message, cdpUrl), null, 2));
+    } else if (action === "send_connect") {
+      if (!url) {
+        console.error("Error: --url bắt buộc");
+        process.exit(1);
+      }
+      console.log(JSON.stringify(await linkedinSendConnect(url, message || "", cdpUrl), null, 2));
     } else if (action === "create_feed_post") {
       if (!title && !description) {
         console.error("Error: cần --title hoặc --description");
