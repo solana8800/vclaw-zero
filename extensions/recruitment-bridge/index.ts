@@ -83,6 +83,7 @@ export default {
               "open_browser",
               "get_session",
               "save_session",
+              "sync_inbox",
             ],
           },
           query: { type: "string", description: "Từ khóa tìm kiếm ứng viên" },
@@ -171,6 +172,9 @@ export default {
             break;
           case "save_session":
             scriptArgs.push("save_session", "--message", args.message);
+            break;
+          case "sync_inbox":
+            scriptArgs.push("sync_inbox");
             break;
           default:
             throw new Error(`Action không hợp lệ: ${action}`);

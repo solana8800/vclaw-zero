@@ -1283,6 +1283,145 @@ function saveSessionToFile(data) {
 }
 
 // ============================================================
+// 7. Đồng bộ tin nhắn LinkedIn (local sync via CDP)
+// ============================================================
+async function linkedinSyncInbox(cdpUrl) {
+  console.error("--- Bắt đầu đồng bộ tin nhắn LinkedIn qua CDP ---");
+  const { browser, page } = await connectPage(cdpUrl);
+
+  const conversations = [];
+  const messages = [];
+
+  // Lắng nghe các cuộc gọi mạng từ trình duyệt
+  page.on("response", async (response) => {
+    const url = response.url();
+    if (url.includes("/voyager/api/messaging/conversations")) {
+      try {
+        const text = await response.text();
+        const data = JSON.parse(text);
+        if (url.includes("/events")) {
+          // Bắt dữ liệu tin nhắn thô của một hội thoại cụ thể
+          const parts = url.split("/conversations/");
+          if (parts.length > 1) {
+            const threadId = parts[1].split("/")[0];
+            messages.push({ threadId, data });
+          }
+        } else {
+          // Bắt dữ liệu danh sách cuộc hội thoại thô
+          conversations.push(data);
+        }
+      } catch (err) {
+        // Bỏ qua lỗi parse JSON hoặc lỗi response rỗng
+      }
+    }
+  });
+
+  try {
+    console.error("--- Điều hướng tới mục nhắn tin LinkedIn ---");
+    await page.goto("https://www.linkedin.com/messaging/", {
+      timeout: 60_000,
+      waitUntil: "domcontentloaded",
+    });
+
+    // Kiểm tra xem có bị chuyển hướng tới trang đăng nhập do phiên hết hạn không
+    const currentUrl = page.url();
+    if (
+      currentUrl.includes("/login") ||
+      currentUrl.includes("/signup") ||
+      currentUrl.includes("/checkpoint")
+    ) {
+      console.error("Lỗi: Phiên đăng nhập LinkedIn đã hết hạn!");
+      return {
+        success: false,
+        error:
+          "Phiên đăng nhập LinkedIn đã hết hạn hoặc chưa được liên kết. Vui lòng vào phần 'Cài đặt tuyển dụng' để kết nối lại tài khoản của bạn.",
+      };
+    }
+
+    // Đợi danh sách hội thoại xuất hiện trên giao diện (tối đa 8 giây)
+    console.error("--- Đợi danh sách hội thoại xuất hiện ---");
+    try {
+      await page.waitForSelector(
+        '.msg-conversations-container__conversations-list, [class*="msg-conversation-card"], .msg-conversation-listitem, a[href*="/messaging/thread/"]',
+        { timeout: 8000 },
+      );
+    } catch (e) {
+      console.error("Timeout chờ danh sách cuộc trò chuyện xuất hiện từ DOM");
+    }
+
+    // Đợi thêm 1.5 giây để dữ liệu tin nhắn preview được render đầy đủ
+    await sleep(1500);
+
+    // Chủ động trích xuất danh sách hội thoại từ DOM trực tiếp
+    console.error("--- Trích xuất danh sách hội thoại trực tiếp từ DOM ---");
+    const domConversations = await page
+      .evaluate(() => {
+        const items = document.querySelectorAll(
+          '.msg-conversation-listitem, [class*="msg-conversation-card"], [class*="msg-conversation-listitem"]',
+        );
+        const results = [];
+        items.forEach((item) => {
+          const linkEl = item.querySelector('a[href*="/messaging/thread/"]');
+          if (!linkEl) return;
+          const href = linkEl.getAttribute("href") || "";
+
+          // Trích xuất threadId từ href
+          const match = href.match(/\/messaging\/thread\/([^/]+)/);
+          if (!match) return;
+          const threadId = match[1];
+
+          // Tên đối tác
+          const nameEl = item.querySelector(
+            '.msg-conversation-card__participant-names, [class*="participant-names"], [class*="profile-link"]',
+          );
+          const name = nameEl ? nameEl.textContent.trim() : "Ứng viên LinkedIn";
+
+          // Tin nhắn preview cuối
+          const snippetEl = item.querySelector(
+            '.msg-conversation-card__message-snippet-body, [class*="message-snippet"]',
+          );
+          const snippet = snippetEl ? snippetEl.textContent.trim() : "";
+
+          // Avatar
+          const imgEl = item.querySelector("img");
+          const avatarUrl = imgEl ? imgEl.getAttribute("src") : null;
+
+          results.push({
+            fromDom: true,
+            threadId,
+            name,
+            snippet,
+            avatarUrl,
+          });
+        });
+        return results;
+      })
+      .catch(() => []);
+
+    // Gộp cả dữ liệu bắt được qua mạng và dữ liệu trích xuất từ DOM
+    const allConversations = [...conversations];
+    if (domConversations && domConversations.length > 0) {
+      allConversations.push({
+        fromDom: true,
+        elements: domConversations,
+      });
+    }
+
+    return {
+      success: true,
+      conversationsCount: domConversations.length || conversations.length,
+      messagesCount: messages.length,
+      conversations: allConversations,
+      messages,
+    };
+  } catch (err) {
+    return { success: false, error: `Lỗi khi đồng bộ tin nhắn qua CDP: ${err.message}` };
+  } finally {
+    await releaseCdpBrowser(browser);
+  }
+}
+
+// ============================================================
 // Main
 // ============================================================
 async function main() {
@@ -1310,6 +1449,7 @@ async function main() {
     "open_browser",
     "get_session",
     "save_session",
+    "sync_inbox",
   ];
   if (!action || !VALID_ACTIONS.includes(action)) {
     console.error(
@@ -1377,6 +1517,8 @@ async function main() {
         process.exit(1);
       }
       console.log(JSON.stringify(saveSessionToFile(message), null, 2));
+    } else if (action === "sync_inbox") {
+      console.log(JSON.stringify(await linkedinSyncInbox(cdpUrl), null, 2));
     }
   } catch (e) {
     console.log(
