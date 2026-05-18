@@ -1223,6 +1223,13 @@ async function linkedinSendMessage(url, message, cdpUrl) {
       await sleep(1200);
       sent = await clickSendMessage(page);
     }
+    // Enter gửi tin ngay trên LinkedIn — compose box trống sau khi gửi = thành công
+    if (!sent) {
+      const editorText = await msgComposerEditor(page)
+        .innerText()
+        .catch(() => "");
+      sent = !editorText.trim();
+    }
     if (!sent) {
       return { success: false, error: "Không nhấn được nút Gửi — kiểm tra LinkedIn messaging UI." };
     }
