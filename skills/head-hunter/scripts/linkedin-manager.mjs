@@ -1289,33 +1289,6 @@ async function linkedinSyncInbox(cdpUrl) {
   console.error("--- Bắt đầu đồng bộ tin nhắn LinkedIn qua CDP ---");
   const { browser, page } = await connectPage(cdpUrl);
 
-  const conversations = [];
-  const messages = [];
-
-  // Lắng nghe các cuộc gọi mạng từ trình duyệt
-  page.on("response", async (response) => {
-    const url = response.url();
-    if (url.includes("/voyager/api/messaging/conversations")) {
-      try {
-        const text = await response.text();
-        const data = JSON.parse(text);
-        if (url.includes("/events")) {
-          // Bắt dữ liệu tin nhắn thô của một hội thoại cụ thể
-          const parts = url.split("/conversations/");
-          if (parts.length > 1) {
-            const threadId = parts[1].split("/")[0];
-            messages.push({ threadId, data });
-          }
-        } else {
-          // Bắt dữ liệu danh sách cuộc hội thoại thô
-          conversations.push(data);
-        }
-      } catch (err) {
-        // Bỏ qua lỗi parse JSON hoặc lỗi response rỗng
-      }
-    }
-  });
-
   try {
     console.error("--- Điều hướng tới mục nhắn tin LinkedIn ---");
     await page.goto("https://www.linkedin.com/messaging/", {
@@ -1323,7 +1296,7 @@ async function linkedinSyncInbox(cdpUrl) {
       waitUntil: "domcontentloaded",
     });
 
-    // Kiểm tra xem có bị chuyển hướng tới trang đăng nhập do phiên hết hạn không
+    // Kiểm tra đăng nhập
     const currentUrl = page.url();
     if (
       currentUrl.includes("/login") ||
@@ -1338,81 +1311,90 @@ async function linkedinSyncInbox(cdpUrl) {
       };
     }
 
-    // Đợi danh sách hội thoại xuất hiện trên giao diện (tối đa 8 giây)
+    // Đợi ít nhất một link thread xuất hiện (selector bền hơn)
     console.error("--- Đợi danh sách hội thoại xuất hiện ---");
     try {
-      await page.waitForSelector(
-        '.msg-conversations-container__conversations-list, [class*="msg-conversation-card"], .msg-conversation-listitem, a[href*="/messaging/thread/"]',
-        { timeout: 8000 },
-      );
+      await page.waitForSelector('a[href*="/messaging/thread/"]', { timeout: 12000 });
     } catch (e) {
-      console.error("Timeout chờ danh sách cuộc trò chuyện xuất hiện từ DOM");
+      console.error("Timeout chờ link thread — thử trích xuất DOM hiện tại");
     }
 
-    // Đợi thêm 1.5 giây để dữ liệu tin nhắn preview được render đầy đủ
-    await sleep(1500);
+    // Scroll xuống nhiều lần để LinkedIn lazy-load thêm hội thoại
+    console.error("--- Scroll để tải thêm hội thoại ---");
+    for (let i = 0; i < 5; i++) {
+      await page.evaluate(() => {
+        const containerSelectors = [
+          ".msg-conversations-container__conversations-list",
+          '[class*="conversations-list"]',
+          ".scaffold-layout__list",
+          ".msg-overlay-list-bubble-scroll-region",
+        ];
+        let scrolled = false;
+        for (const sel of containerSelectors) {
+          const el = document.querySelector(sel);
+          if (el) {
+            el.scrollTop = el.scrollHeight;
+            scrolled = true;
+            break;
+          }
+        }
+        if (!scrolled) window.scrollTo(0, document.body.scrollHeight);
+      });
+      await sleep(1000);
+    }
 
-    // Chủ động trích xuất danh sách hội thoại từ DOM trực tiếp
-    console.error("--- Trích xuất danh sách hội thoại trực tiếp từ DOM ---");
+    // Trích xuất danh sách hội thoại — anchor trên link thread (bền với thay đổi class)
+    console.error("--- Trích xuất danh sách hội thoại từ DOM ---");
     const domConversations = await page
       .evaluate(() => {
-        const items = document.querySelectorAll(
-          '.msg-conversation-listitem, [class*="msg-conversation-card"], [class*="msg-conversation-listitem"]',
-        );
+        const seen = new Set();
         const results = [];
-        items.forEach((item) => {
-          const linkEl = item.querySelector('a[href*="/messaging/thread/"]');
-          if (!linkEl) return;
-          const href = linkEl.getAttribute("href") || "";
 
-          // Trích xuất threadId từ href
-          const match = href.match(/\/messaging\/thread\/([^/]+)/);
+        document.querySelectorAll('a[href*="/messaging/thread/"]').forEach((linkEl) => {
+          const href = linkEl.getAttribute("href") || "";
+          const match = href.match(/\/messaging\/thread\/([^/?#]+)/);
           if (!match) return;
           const threadId = match[1];
+          if (seen.has(threadId)) return;
+          seen.add(threadId);
 
-          // Tên đối tác
-          const nameEl = item.querySelector(
-            '.msg-conversation-card__participant-names, [class*="participant-names"], [class*="profile-link"]',
+          const container =
+            linkEl.closest("li") ||
+            linkEl.closest('[class*="conversation"]') ||
+            linkEl.parentElement;
+
+          const nameEl = container?.querySelector(
+            'h3, strong, [class*="participant-names"], [class*="name"]',
           );
-          const name = nameEl ? nameEl.textContent.trim() : "Ứng viên LinkedIn";
+          const name = (
+            nameEl?.textContent?.trim() ||
+            linkEl.textContent?.trim() ||
+            "Ứng viên LinkedIn"
+          ).replace(/\s+/g, " ");
 
-          // Tin nhắn preview cuối
-          const snippetEl = item.querySelector(
-            '.msg-conversation-card__message-snippet-body, [class*="message-snippet"]',
+          const snippetEl = container?.querySelector(
+            '[class*="message-snippet"], [class*="snippet"], [class*="preview"]',
           );
-          const snippet = snippetEl ? snippetEl.textContent.trim() : "";
+          const snippet = snippetEl?.textContent?.trim() || "";
 
-          // Avatar
-          const imgEl = item.querySelector("img");
-          const avatarUrl = imgEl ? imgEl.getAttribute("src") : null;
+          const imgEl = container?.querySelector("img");
+          const avatarUrl = imgEl?.getAttribute("src") || null;
 
-          results.push({
-            fromDom: true,
-            threadId,
-            name,
-            snippet,
-            avatarUrl,
-          });
+          results.push({ fromDom: true, threadId, name, snippet, avatarUrl });
         });
         return results;
       })
       .catch(() => []);
 
-    // Gộp cả dữ liệu bắt được qua mạng và dữ liệu trích xuất từ DOM
-    const allConversations = [...conversations];
-    if (domConversations && domConversations.length > 0) {
-      allConversations.push({
-        fromDom: true,
-        elements: domConversations,
-      });
-    }
+    console.error(`--- Tìm thấy ${domConversations.length} hội thoại ---`);
 
     return {
       success: true,
-      conversationsCount: domConversations.length || conversations.length,
-      messagesCount: messages.length,
-      conversations: allConversations,
-      messages,
+      conversationsCount: domConversations.length,
+      messagesCount: 0,
+      conversations:
+        domConversations.length > 0 ? [{ fromDom: true, elements: domConversations }] : [],
+      messages: [],
     };
   } catch (err) {
     return { success: false, error: `Lỗi khi đồng bộ tin nhắn qua CDP: ${err.message}` };
