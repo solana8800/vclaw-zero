@@ -84,6 +84,7 @@ export default {
               "get_session",
               "save_session",
               "sync_inbox",
+              "sync_thread",
             ],
           },
           query: { type: "string", description: "Từ khóa tìm kiếm ứng viên" },
@@ -108,6 +109,10 @@ export default {
           imagePath: {
             type: "string",
             description: "Đường dẫn file ảnh PNG/JPEG local để đính kèm bài feed",
+          },
+          threadId: {
+            type: "string",
+            description: "ID hội thoại LinkedIn (dùng cho sync_thread)",
           },
         },
         required: ["action"],
@@ -175,6 +180,9 @@ export default {
             break;
           case "sync_inbox":
             scriptArgs.push("sync_inbox");
+            break;
+          case "sync_thread":
+            scriptArgs.push("sync_thread", "--url", args.threadId || args.url);
             break;
           default:
             throw new Error(`Action không hợp lệ: ${action}`);

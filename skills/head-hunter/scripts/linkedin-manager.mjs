@@ -425,6 +425,7 @@ const LINKEDIN_SEARCH_MAX = Math.min(
 async function linkedinSearch(query, cdpUrl) {
   console.error(`--- Đang tìm kiếm ứng viên với từ khóa: '${query}' ---`);
   const { browser, page } = await connectPage(cdpUrl);
+
   try {
     const encoded = encodeURIComponent(query);
     await page.goto(`https://www.linkedin.com/search/results/people/?keywords=${encoded}`, {
@@ -459,7 +460,7 @@ async function linkedinSearch(query, cdpUrl) {
     if (selectors.length === 0) selectors = await page.locator(".entity-result").all();
     if (selectors.length === 0) selectors = await page.locator("div:has(a[href*='/in/'])").all();
 
-    console.error(`--- Tìm thấy ${selectors.length} thẻ kết quả ---`);
+    console.error(`--- Tìm thấy ${selectors.length} thẻ DOM ---`);
 
     const seen = new Set();
     const results = [];
@@ -482,16 +483,24 @@ async function linkedinSearch(query, cdpUrl) {
           .locator(".entity-result__primary-subtitle, .subline-level-1")
           .first();
         const headline = (await headlineEl.count()) ? (await headlineEl.innerText()).trim() : "N/A";
+
         const locationEl = sel
           .locator(".entity-result__secondary-subtitle, .subline-level-2")
           .first();
         const location = (await locationEl.count()) ? (await locationEl.innerText()).trim() : "N/A";
 
-        results.push({ name, headline, profile_url: profileUrl, location });
+        results.push({
+          name,
+          headline,
+          profile_url: profileUrl,
+          profile_id_url: null,
+          location,
+        });
       } catch (e) {
         console.error(`⚠️ Lỗi trích xuất: ${e}`);
       }
     }
+
     return results;
   } finally {
     await releaseCdpBrowser(browser);
@@ -566,6 +575,7 @@ async function linkedinGetProfile(url, cdpUrl) {
   const targetUrl = url || "https://www.linkedin.com/feed/";
   console.error(`--- Đang lấy thông tin profile (Identify): ${targetUrl} ---`);
   const { browser, page } = await connectPage(cdpUrl);
+
   try {
     await page.goto(targetUrl, { timeout: 60_000 });
     await page.waitForLoadState("networkidle").catch(() => null);
@@ -705,7 +715,8 @@ async function linkedinGetProfile(url, cdpUrl) {
         /* bỏ qua */
       }
 
-      let profileUrl = currentUrl;
+      // Lấy profileUrl từ currentUrl hoặc DOM (không dùng API interception)
+      let profileUrl = currentUrl.split("?")[0];
       if (!profileUrl.includes("/in/")) {
         const profileLink = page.locator("a[href*='/in/']").first();
         if (await profileLink.count()) {
@@ -716,6 +727,24 @@ async function linkedinGetProfile(url, cdpUrl) {
               : `https://www.linkedin.com${href.split("?")[0]}`;
           }
         }
+      }
+
+      // profileIdUrl: nếu input url khác với profileUrl sau navigate → input là ID URL (/in/ACoAAC...)
+      // LinkedIn tự redirect từ ID URL sang slug URL nên currentUrl sẽ là slug
+      const normalizeForCompare = (u) =>
+        (u || "")
+          .replace(/^https?:\/\/(www\.)?linkedin\.com/i, "")
+          .replace(/\/$/, "")
+          .toLowerCase();
+      const inputNorm = normalizeForCompare(url || "");
+      const slugNorm = normalizeForCompare(profileUrl);
+      let profileIdUrl = null;
+      if (inputNorm && inputNorm !== slugNorm && inputNorm.includes("/in/")) {
+        // Input url là ID URL — normalize thành absolute
+        profileIdUrl = (url || "").startsWith("http")
+          ? url.split("?")[0]
+          : `https://www.linkedin.com${(url || "").startsWith("/") ? url.split("?")[0] : "/in/" + url.split("?")[0]}`;
+        console.error(`[getProfile] profileIdUrl từ input: ${profileIdUrl} → slug: ${profileUrl}`);
       }
 
       if (sessionCookie && sessionData) {
@@ -754,7 +783,8 @@ async function linkedinGetProfile(url, cdpUrl) {
         projects,
         languages,
         recommendations,
-        url: profileUrl,
+        url: profileUrl, // slug URL: /in/que-le-ta/
+        profileIdUrl, // ID URL: /in/ACoAAC.../  (null nếu API không trả về)
         avatarUrl,
         connectionStatus,
         sessionCookie,
@@ -1283,11 +1313,48 @@ function saveSessionToFile(data) {
 }
 
 // ============================================================
-// 7. Đồng bộ tin nhắn LinkedIn (local sync via CDP)
+// 7. Đồng bộ toàn bộ inbox LinkedIn (local sync via CDP)
 // ============================================================
 async function linkedinSyncInbox(cdpUrl) {
   console.error("--- Bắt đầu đồng bộ tin nhắn LinkedIn qua CDP ---");
   const { browser, page } = await connectPage(cdpUrl);
+
+  const collectedConversations = [];
+  const collectedMessages = [];
+
+  // Dùng CDP session trực tiếp để đọc response body (page.on('response') không đọc được body
+  // khi kết nối qua connectOverCDP vì browser đã consume response trước Playwright)
+  const cdpSession = await page.context().newCDPSession(page);
+  await cdpSession.send("Network.enable");
+
+  let graphqlHits = 0;
+  let graphqlBodyErrors = 0;
+
+  cdpSession.on("Network.responseReceived", async ({ requestId, response }) => {
+    const url = response.url;
+    if (!url.includes("voyagerMessagingGraphQL/graphql")) return;
+    graphqlHits++;
+    console.error(`[syncInbox CDP] GraphQL hit #${graphqlHits}: ${url.split("?")[0]}`);
+    try {
+      const { body } = await cdpSession.send("Network.getResponseBody", { requestId });
+      const json = JSON.parse(body);
+      // Log tất cả top-level data keys để phát hiện API đổi tên
+      const dataKeys = Object.keys(json?.data ?? {}).join(", ");
+      console.error(`[syncInbox CDP]   data keys: ${dataKeys || "(trống)"}`);
+      const elements = json?.data?.messengerConversationsBySyncToken?.elements;
+      if (elements?.length > 0) {
+        console.error(
+          `[syncInbox CDP]   messengerConversationsBySyncToken: ${elements.length} hội thoại`,
+        );
+        collectedConversations.push(json);
+      } else if (dataKeys) {
+        console.error(`[syncInbox CDP]   Không có messengerConversationsBySyncToken — bỏ qua`);
+      }
+    } catch (e) {
+      graphqlBodyErrors++;
+      console.error(`[syncInbox CDP]   Lỗi đọc body #${graphqlBodyErrors}: ${e.message}`);
+    }
+  });
 
   try {
     console.error("--- Điều hướng tới mục nhắn tin LinkedIn ---");
@@ -1298,6 +1365,7 @@ async function linkedinSyncInbox(cdpUrl) {
 
     // Kiểm tra đăng nhập
     const currentUrl = page.url();
+    console.error(`[syncInbox] URL hiện tại sau navigate: ${currentUrl}`);
     if (
       currentUrl.includes("/login") ||
       currentUrl.includes("/signup") ||
@@ -1311,15 +1379,11 @@ async function linkedinSyncInbox(cdpUrl) {
       };
     }
 
-    // Đợi ít nhất một link thread xuất hiện (selector bền hơn)
-    console.error("--- Đợi danh sách hội thoại xuất hiện ---");
-    try {
-      await page.waitForSelector('a[href*="/messaging/thread/"]', { timeout: 12000 });
-    } catch (e) {
-      console.error("Timeout chờ link thread — thử trích xuất DOM hiện tại");
-    }
+    // Đợi API conversations được tải xong
+    console.error("--- Đợi API LinkedIn phản hồi ---");
+    await sleep(3000);
 
-    // Scroll xuống nhiều lần để LinkedIn lazy-load thêm hội thoại
+    // Scroll để kích hoạt LinkedIn lazy-load thêm hội thoại cũ hơn
     console.error("--- Scroll để tải thêm hội thoại ---");
     for (let i = 0; i < 5; i++) {
       await page.evaluate(() => {
@@ -1340,65 +1404,324 @@ async function linkedinSyncInbox(cdpUrl) {
         }
         if (!scrolled) window.scrollTo(0, document.body.scrollHeight);
       });
-      await sleep(1000);
+      await sleep(1500);
     }
 
-    // Trích xuất danh sách hội thoại — anchor trên link thread (bền với thay đổi class)
-    console.error("--- Trích xuất danh sách hội thoại từ DOM ---");
-    const domConversations = await page
-      .evaluate(() => {
-        const seen = new Set();
-        const results = [];
+    // Đợi thêm để thu thập phản hồi API cuối cùng sau scroll
+    await sleep(2000);
 
-        document.querySelectorAll('a[href*="/messaging/thread/"]').forEach((linkEl) => {
-          const href = linkEl.getAttribute("href") || "";
-          const match = href.match(/\/messaging\/thread\/([^/?#]+)/);
-          if (!match) return;
-          const threadId = match[1];
-          if (seen.has(threadId)) return;
-          seen.add(threadId);
+    // Tổng kết CDP
+    console.error(
+      `[syncInbox CDP] Tổng: ${graphqlHits} GraphQL hit, ${graphqlBodyErrors} lỗi đọc body, ${collectedConversations.length} batch hợp lệ`,
+    );
 
-          const container =
-            linkEl.closest("li") ||
-            linkEl.closest('[class*="conversation"]') ||
-            linkEl.parentElement;
+    // Fallback DOM nếu CDP không bắt được response nào
+    if (collectedConversations.length === 0) {
+      console.error("Không bắt được API response qua CDP — thử DOM fallback...");
+      // Log page title + sample DOM để debug
+      const pageInfo = await page
+        .evaluate(() => ({
+          title: document.title,
+          url: location.href,
+          threadLinks: document.querySelectorAll('a[href*="/messaging/thread/"]').length,
+          bodyText: document.body?.innerText?.slice(0, 200) ?? "",
+        }))
+        .catch(() => null);
+      console.error("[syncInbox DOM] Page info:", JSON.stringify(pageInfo));
+      const domConversations = await page
+        .evaluate(() => {
+          const seen = new Set();
+          const results = [];
+          document.querySelectorAll('a[href*="/messaging/thread/"]').forEach((linkEl) => {
+            const href = linkEl.getAttribute("href") || "";
+            const match = href.match(/\/messaging\/thread\/([^/?#]+)/);
+            if (!match) return;
+            const threadId = match[1];
+            if (seen.has(threadId)) return;
+            seen.add(threadId);
 
-          const nameEl = container?.querySelector(
-            'h3, strong, [class*="participant-names"], [class*="name"]',
-          );
-          const name = (
-            nameEl?.textContent?.trim() ||
-            linkEl.textContent?.trim() ||
-            "Ứng viên LinkedIn"
-          ).replace(/\s+/g, " ");
+            const container =
+              linkEl.closest("li") ||
+              linkEl.closest('[class*="conversation"]') ||
+              linkEl.parentElement;
 
-          const snippetEl = container?.querySelector(
-            '[class*="message-snippet"], [class*="snippet"], [class*="preview"]',
-          );
-          const snippet = snippetEl?.textContent?.trim() || "";
+            const nameEl = container?.querySelector(
+              'h3, strong, [class*="participant-names"], [class*="name"]',
+            );
+            const name = (
+              nameEl?.textContent?.trim() ||
+              linkEl.textContent?.trim() ||
+              "Ứng viên LinkedIn"
+            ).replace(/\s+/g, " ");
 
-          const imgEl = container?.querySelector("img");
-          const avatarUrl = imgEl?.getAttribute("src") || null;
+            const snippetEl = container?.querySelector(
+              '[class*="message-snippet"], [class*="snippet"], [class*="preview"]',
+            );
+            const snippet = snippetEl?.textContent?.trim() || "";
 
-          results.push({ fromDom: true, threadId, name, snippet, avatarUrl });
-        });
-        return results;
-      })
-      .catch(() => []);
+            const imgEl = container?.querySelector("img");
+            const avatarUrl = imgEl?.getAttribute("src") || null;
 
-    console.error(`--- Tìm thấy ${domConversations.length} hội thoại ---`);
+            results.push({ fromDom: true, threadId, name, snippet, avatarUrl });
+          });
+          return results;
+        })
+        .catch(() => []);
+
+      console.error(`[syncInbox DOM] tìm thấy ${domConversations.length} thread`);
+      if (domConversations.length > 0) {
+        collectedConversations.push({ fromDom: true, elements: domConversations });
+      }
+    }
+
+    const convCount = collectedConversations.reduce((sum, c) => {
+      if (c.fromDom) return sum + (c.elements?.length || 0);
+      return (
+        sum +
+        (c.data?.messengerConversationsBySyncToken?.elements?.length || c.elements?.length || 0)
+      );
+    }, 0);
+    console.error(
+      `--- Đồng bộ xong: ${convCount} hội thoại, ${collectedMessages.length} thread tin nhắn ---`,
+    );
 
     return {
       success: true,
-      conversationsCount: domConversations.length,
-      messagesCount: 0,
-      conversations:
-        domConversations.length > 0 ? [{ fromDom: true, elements: domConversations }] : [],
-      messages: [],
+      conversationsCount: convCount,
+      messagesCount: collectedMessages.length,
+      conversations: collectedConversations,
+      messages: collectedMessages,
     };
   } catch (err) {
     return { success: false, error: `Lỗi khi đồng bộ tin nhắn qua CDP: ${err.message}` };
   } finally {
+    await cdpSession.detach().catch(() => {});
+    await releaseCdpBrowser(browser);
+  }
+}
+
+// ============================================================
+// 8. Đồng bộ chi tiết tin nhắn một hội thoại cụ thể (per-thread)
+// ============================================================
+async function linkedinSyncThread(threadId, cdpUrl) {
+  console.error(`--- Bắt đầu đồng bộ tin nhắn thread: ${threadId} ---`);
+  const { browser, page } = await connectPage(cdpUrl);
+
+  const collectedMessages = [];
+
+  const cdpSession = await page.context().newCDPSession(page);
+
+  const targetUrn = `urn:li:messagingThread:${threadId}`;
+
+  // Dùng Fetch.enable thay vì Network.responseReceived để đảm bảo body luôn sẵn sàng
+  // Bắt rộng hơn: voyager/api để không bỏ sót URL variant
+  await cdpSession.send("Fetch.enable", {
+    patterns: [
+      { urlPattern: "*voyagerMessagingGraphQL*", requestStage: "Response" },
+      { urlPattern: "*voyager/api/messaging*", requestStage: "Response" },
+    ],
+  });
+
+  let fetchInterceptCount = 0;
+
+  cdpSession.on("Fetch.requestPaused", async ({ requestId, request, responseStatusCode }) => {
+    const reqUrl = (request?.url || "").split("?")[0];
+    fetchInterceptCount++;
+    console.error(
+      `[syncThread Fetch #${fetchInterceptCount}] url=${reqUrl} | status=${responseStatusCode ?? "?"}`,
+    );
+    try {
+      if (responseStatusCode && responseStatusCode >= 200 && responseStatusCode < 300) {
+        let jsonStr;
+        try {
+          const { body, base64Encoded } = await cdpSession.send("Fetch.getResponseBody", {
+            requestId,
+          });
+          jsonStr = base64Encoded ? Buffer.from(body, "base64").toString("utf-8") : body;
+        } catch (bodyErr) {
+          console.error(
+            `[syncThread Fetch #${fetchInterceptCount}] getResponseBody lỗi: ${bodyErr.message}`,
+          );
+          return;
+        }
+
+        let json;
+        try {
+          json = JSON.parse(jsonStr);
+        } catch {
+          console.error(
+            `[syncThread Fetch #${fetchInterceptCount}] JSON parse lỗi (${jsonStr?.length ?? 0} bytes)`,
+          );
+          return;
+        }
+
+        const dataKeys = Object.keys(json?.data || {});
+        console.error(
+          `[syncThread Fetch #${fetchInterceptCount}] data keys: [${dataKeys.join(", ")}]`,
+        );
+
+        let handled = false;
+
+        // Kiểu chính: messengerMessagesBySyncToken — flat list messages của thread
+        // queryId=messengerMessages.xxx, mỗi message có backendConversationUrn để filter
+        const syncMessages = json?.data?.messengerMessagesBySyncToken?.elements;
+        if (Array.isArray(syncMessages)) {
+          handled = true;
+          const filtered = syncMessages.filter(
+            (m) => !m.backendConversationUrn || m.backendConversationUrn === targetUrn,
+          );
+          console.error(
+            `[syncThread Fetch #${fetchInterceptCount}] messengerMessagesBySyncToken: ${syncMessages.length} tổng, ${filtered.length} khớp thread`,
+          );
+          collectedMessages.push(...filtered);
+        }
+
+        // Kiểu phụ 1: messengerMessagesByAnchorTimestamp
+        const threadMsgs = json?.data?.messengerMessagesByAnchorTimestamp?.elements;
+        if (Array.isArray(threadMsgs)) {
+          handled = true;
+          console.error(
+            `[syncThread Fetch #${fetchInterceptCount}] messengerMessagesByAnchorTimestamp: ${threadMsgs.length} tin nhắn`,
+          );
+          collectedMessages.push(...threadMsgs);
+        }
+
+        // Kiểu phụ 2: messengerConversationsBySyncToken — inbox batch (filter theo thread)
+        const convElements = json?.data?.messengerConversationsBySyncToken?.elements;
+        if (Array.isArray(convElements)) {
+          handled = true;
+          let matched = 0;
+          for (const conv of convElements) {
+            const convUrn = conv.backendUrn;
+            if (convUrn && convUrn !== targetUrn) continue;
+            const msgElements = conv.messages?.elements;
+            if (msgElements?.length > 0) {
+              matched++;
+              console.error(
+                `[syncThread Fetch #${fetchInterceptCount}] inbox conv (target): ${msgElements.length} tin nhắn`,
+              );
+              collectedMessages.push(...msgElements);
+            }
+          }
+          if (matched === 0) {
+            console.error(
+              `[syncThread Fetch #${fetchInterceptCount}] inbox batch: ${convElements.length} conv, không tìm thấy targetUrn`,
+            );
+          }
+        }
+
+        // Kiểu phụ 3: messengerConversation — single conv object
+        const singleConv = json?.data?.messengerConversation;
+        if (singleConv) {
+          handled = true;
+          const convUrn = singleConv.backendUrn;
+          const msgCount = singleConv.messages?.elements?.length ?? 0;
+          console.error(
+            `[syncThread Fetch #${fetchInterceptCount}] messengerConversation: urn=${convUrn} | msgs=${msgCount}`,
+          );
+          if (msgCount > 0 && (!convUrn || convUrn === targetUrn)) {
+            collectedMessages.push(...singleConv.messages.elements);
+          }
+        }
+
+        if (!handled && dataKeys.length > 0) {
+          console.error(
+            `[syncThread Fetch #${fetchInterceptCount}] Không nhận dạng data. Keys: [${dataKeys.join(", ")}]`,
+          );
+        }
+      } else {
+        console.error(
+          `[syncThread Fetch #${fetchInterceptCount}] bỏ qua status=${responseStatusCode}`,
+        );
+      }
+    } catch (e) {
+      console.error(`[syncThread Fetch #${fetchInterceptCount}] lỗi xử lý: ${e.message}`);
+    } finally {
+      await cdpSession.send("Fetch.continueRequest", { requestId }).catch((e) => {
+        console.error(`[syncThread Fetch] continueRequest lỗi: ${e.message}`);
+      });
+    }
+  });
+
+  try {
+    // Mở thẳng URL hội thoại
+    const threadUrl = `https://www.linkedin.com/messaging/thread/${encodeURIComponent(threadId)}/`;
+    console.error(`--- [syncThread] Fetch.enable đã bật, điều hướng tới ${threadUrl} ---`);
+    await page.goto(threadUrl, { timeout: 60_000, waitUntil: "domcontentloaded" });
+
+    const currentUrl = page.url();
+    console.error(`--- [syncThread] currentUrl sau goto: ${currentUrl} ---`);
+    if (
+      currentUrl.includes("/login") ||
+      currentUrl.includes("/signup") ||
+      currentUrl.includes("/checkpoint")
+    ) {
+      return {
+        success: false,
+        error: "Phiên đăng nhập LinkedIn đã hết hạn. Vui lòng kết nối lại tài khoản.",
+      };
+    }
+
+    // Đợi API tải xong — tăng lên 5s để đảm bảo tất cả request kịp fire
+    console.error(
+      `--- [syncThread] Đợi 5s cho API tải xong, fetchInterceptCount=${fetchInterceptCount} ---`,
+    );
+    await sleep(5000);
+    console.error(
+      `--- [syncThread] Sau 5s: collectedMessages=${collectedMessages.length}, fetchInterceptCount=${fetchInterceptCount} ---`,
+    );
+
+    // Scroll lên đầu để kích hoạt tải thêm tin nhắn cũ hơn
+    console.error(`--- [syncThread] Scroll lên đầu (3 lần) để trigger load thêm ---`);
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => {
+        const selectors = [
+          ".msg-s-message-list-container",
+          '[class*="message-list"]',
+          ".scaffold-layout__detail",
+          ".msg-conversations-container",
+        ];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el) {
+            console.log(`[scroll] Found ${sel}, scrollTop from ${el.scrollTop} to 0`);
+            el.scrollTop = 0;
+            return;
+          }
+        }
+        console.log("[scroll] Không tìm thấy message container, dùng window.scrollTo");
+        window.scrollTo(0, 0);
+      });
+      await sleep(1500);
+      console.error(
+        `--- [syncThread] Sau scroll ${i + 1}: collectedMessages=${collectedMessages.length} ---`,
+      );
+    }
+
+    await sleep(2000);
+    console.error(
+      `--- [syncThread] Kết thúc chờ: collectedMessages=${collectedMessages.length}, fetchInterceptCount=${fetchInterceptCount} ---`,
+    );
+
+    // Dedup theo backendUrn
+    const seen = new Set();
+    const unique = collectedMessages.filter((m) => {
+      if (!m.backendUrn) return true;
+      if (seen.has(m.backendUrn)) return false;
+      seen.add(m.backendUrn);
+      return true;
+    });
+
+    console.error(
+      `--- [syncThread] Đồng bộ xong: ${unique.length} tin nhắn duy nhất (thread: ${threadId}) ---`,
+    );
+    return { success: true, messages: unique, messagesCount: unique.length };
+  } catch (err) {
+    console.error(`--- [syncThread] Lỗi: ${err.message} ---`);
+    return { success: false, error: `Lỗi khi đồng bộ thread: ${err.message}` };
+  } finally {
+    await cdpSession.send("Fetch.disable").catch(() => {});
+    await cdpSession.detach().catch(() => {});
     await releaseCdpBrowser(browser);
   }
 }
@@ -1432,6 +1755,7 @@ async function main() {
     "get_session",
     "save_session",
     "sync_inbox",
+    "sync_thread",
   ];
   if (!action || !VALID_ACTIONS.includes(action)) {
     console.error(
@@ -1501,6 +1825,12 @@ async function main() {
       console.log(JSON.stringify(saveSessionToFile(message), null, 2));
     } else if (action === "sync_inbox") {
       console.log(JSON.stringify(await linkedinSyncInbox(cdpUrl), null, 2));
+    } else if (action === "sync_thread") {
+      if (!url) {
+        console.error("Error: --url (threadId) bắt buộc");
+        process.exit(1);
+      }
+      console.log(JSON.stringify(await linkedinSyncThread(url, cdpUrl), null, 2));
     }
   } catch (e) {
     console.log(
