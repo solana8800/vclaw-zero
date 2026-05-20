@@ -1160,10 +1160,10 @@ async function clickSendMessage(page) {
 async function linkedinSendMessageVoyager(profileIdUrl, message, cdpUrl, knownThreadId = null) {
   let profileUrl = (profileIdUrl || "").split("?")[0];
   const idMatch = profileUrl.match(/\/in\/([^/?#\s]+)/);
-  if (!idMatch) {
+  if (!idMatch && !knownThreadId) {
     return { success: false, error: "profileIdUrl không chứa /in/<id>" };
   }
-  if (!profileUrl.startsWith("http")) {
+  if (profileUrl && !profileUrl.startsWith("http")) {
     profileUrl = `https://www.linkedin.com${profileUrl.startsWith("/") ? profileUrl : `/in/${profileUrl}`}`;
   }
 
@@ -2046,8 +2046,8 @@ async function main() {
       // linkedinGetProfile đã handle url null → /me
       console.log(JSON.stringify(await linkedinGetProfile(url, cdpUrl), null, 2));
     } else if (action === "send_message") {
-      if (!url || !message) {
-        console.error("Error: --url và --message bắt buộc");
+      if ((!url && !cli.threadId) || !message) {
+        console.error("Error: --url hoặc --threadId, và --message là bắt buộc");
         process.exit(1);
       }
       // Thử Voyager API trước (không navigate, không click — ít bị detect)
