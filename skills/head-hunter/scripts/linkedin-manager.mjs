@@ -1534,129 +1534,6 @@ async function linkedinSyncInbox(cdpUrl) {
 }
 
 // ============================================================
-// 8. Lắng nghe tin nhắn mới trong LinkedIn Inbox (không lưu DB)
-// ============================================================
-async function linkedinListenNewMessages(cdpUrl) {
-  console.error("--- Kiểm tra tin nhắn mới LinkedIn Inbox ---");
-  // Dùng existing page (giống syncInbox) thay vì newPage() — tránh load LinkedIn từ đầu quá chậm
-  const { browser, page } = await connectPage(cdpUrl);
-
-  const rawElements = [];
-  const cdpSession = await page.context().newCDPSession(page);
-  await cdpSession.send("Fetch.enable", {
-    patterns: [
-      { urlPattern: "*voyagerMessagingGraphQL*", requestStage: "Response" },
-      { urlPattern: "*voyager/api/messaging*", requestStage: "Response" },
-    ],
-  });
-  let fetchInterceptCount = 0;
-
-  cdpSession.on("Fetch.requestPaused", async ({ requestId, request, responseStatusCode }) => {
-    fetchInterceptCount++;
-    try {
-      if (responseStatusCode && responseStatusCode >= 200 && responseStatusCode < 300) {
-        let json;
-        try {
-          const { body, base64Encoded } = await cdpSession.send("Fetch.getResponseBody", {
-            requestId,
-          });
-          const text = base64Encoded ? Buffer.from(body, "base64").toString("utf-8") : body;
-          json = JSON.parse(text);
-        } catch {
-          return;
-        }
-        const elements = json?.data?.messengerConversationsBySyncToken?.elements;
-        if (Array.isArray(elements) && elements.length > 0) {
-          console.error(
-            `[listenInbox] messengerConversationsBySyncToken: ${elements.length} hội thoại`,
-          );
-          rawElements.push(...elements);
-        }
-      }
-    } catch (e) {
-      console.error(`[listenInbox] Lỗi xử lý: ${e.message}`);
-    } finally {
-      await cdpSession.send("Fetch.continueRequest", { requestId }).catch(() => {});
-    }
-  });
-
-  try {
-    await page.goto("https://www.linkedin.com/messaging/", {
-      timeout: 60_000,
-      waitUntil: "domcontentloaded",
-    });
-
-    const currentUrl = page.url();
-    if (
-      currentUrl.includes("/login") ||
-      currentUrl.includes("/signup") ||
-      currentUrl.includes("/checkpoint")
-    ) {
-      return {
-        success: false,
-        conversations: [],
-        error: "Phiên đăng nhập LinkedIn đã hết hạn hoặc chưa kết nối.",
-      };
-    }
-
-    // Tin nhắn mới luôn nằm đầu batch đầu tiên — không cần scroll
-    await sleep(5000);
-
-    console.error(
-      `[listenInbox] ${fetchInterceptCount} Fetch intercept, ${rawElements.length} conv raw`,
-    );
-
-    // Parse thành danh sách flat
-    const seen = new Set();
-    const conversations = [];
-    for (const conv of rawElements) {
-      const threadId = conv.backendUrn?.replace("urn:li:messagingThread:", "");
-      if (!threadId || seen.has(threadId)) continue;
-      seen.add(threadId);
-
-      const lastMsg = conv.messages?.elements?.[0];
-      if (!lastMsg) continue;
-
-      const deliveredAt = typeof lastMsg.deliveredAt === "number" ? lastMsg.deliveredAt : null;
-      const fromSelf = lastMsg.actor?.participantType?.member?.distance === "SELF";
-
-      const senderMember = conv.conversationParticipants?.find(
-        (p) => p.participantType?.member?.distance !== "SELF",
-      )?.participantType?.member;
-
-      const senderName =
-        [senderMember?.firstName?.text, senderMember?.lastName?.text]
-          .filter(Boolean)
-          .join(" ")
-          .trim() || "LinkedIn";
-      const senderProfileUrl = senderMember?.profileUrl ?? null;
-      const lastMessageText = lastMsg.body?.text ?? "";
-
-      conversations.push({
-        threadId,
-        senderName,
-        senderProfileUrl,
-        lastMessageText,
-        deliveredAt,
-        fromSelf,
-      });
-    }
-
-    console.error(`[listenInbox] Parsed ${conversations.length} hội thoại`);
-    return { success: true, conversations };
-  } catch (err) {
-    return {
-      success: false,
-      conversations: [],
-      error: `Lỗi khi lắng nghe tin nhắn: ${err.message}`,
-    };
-  } finally {
-    await cdpSession.detach().catch(() => {});
-    await releaseCdpBrowser(browser);
-  }
-}
-
-// ============================================================
 // 9. Đồng bộ chi tiết tin nhắn một hội thoại cụ thể (per-thread)
 // ============================================================
 async function linkedinSyncThread(threadId, cdpUrl) {
@@ -1912,7 +1789,6 @@ async function main() {
     "save_session",
     "sync_inbox",
     "sync_thread",
-    "listen_new_messages",
   ];
   if (!action || !VALID_ACTIONS.includes(action)) {
     console.error(
@@ -1988,8 +1864,6 @@ async function main() {
         process.exit(1);
       }
       console.log(JSON.stringify(await linkedinSyncThread(url, cdpUrl), null, 2));
-    } else if (action === "listen_new_messages") {
-      console.log(JSON.stringify(await linkedinListenNewMessages(cdpUrl), null, 2));
     }
   } catch (e) {
     console.log(

@@ -85,7 +85,6 @@ export default {
               "save_session",
               "sync_inbox",
               "sync_thread",
-              "listen_new_messages",
             ],
           },
           query: { type: "string", description: "Từ khóa tìm kiếm ứng viên" },
@@ -184,9 +183,6 @@ export default {
             break;
           case "sync_thread":
             scriptArgs.push("sync_thread", "--url", args.threadId || args.url);
-            break;
-          case "listen_new_messages":
-            scriptArgs.push("listen_new_messages");
             break;
           default:
             throw new Error(`Action không hợp lệ: ${action}`);
