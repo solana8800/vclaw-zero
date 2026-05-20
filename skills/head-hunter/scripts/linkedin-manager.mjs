@@ -1322,37 +1322,70 @@ async function linkedinSyncInbox(cdpUrl) {
   const collectedConversations = [];
   const collectedMessages = [];
 
-  // Dùng CDP session trực tiếp để đọc response body (page.on('response') không đọc được body
-  // khi kết nối qua connectOverCDP vì browser đã consume response trước Playwright)
+  // Dùng Fetch.enable (requestStage: Response) thay vì Network.responseReceived vì
+  // Network.getResponseBody không đọc được khi connect qua connectOverCDP — browser đã consume body trước.
+  // Fetch.enable "pause" response trước khi deliver tới page, đọc body qua Fetch.getResponseBody luôn OK.
   const cdpSession = await page.context().newCDPSession(page);
-  await cdpSession.send("Network.enable");
+  await cdpSession.send("Fetch.enable", {
+    patterns: [
+      { urlPattern: "*voyagerMessagingGraphQL*", requestStage: "Response" },
+      { urlPattern: "*voyager/api/messaging*", requestStage: "Response" },
+    ],
+  });
 
-  let graphqlHits = 0;
-  let graphqlBodyErrors = 0;
+  let fetchInterceptCount = 0;
 
-  cdpSession.on("Network.responseReceived", async ({ requestId, response }) => {
-    const url = response.url;
-    if (!url.includes("voyagerMessagingGraphQL/graphql")) return;
-    graphqlHits++;
-    console.error(`[syncInbox CDP] GraphQL hit #${graphqlHits}: ${url.split("?")[0]}`);
+  cdpSession.on("Fetch.requestPaused", async ({ requestId, request, responseStatusCode }) => {
+    const reqUrl = (request?.url || "").split("?")[0];
+    fetchInterceptCount++;
+    console.error(
+      `[syncInbox Fetch #${fetchInterceptCount}] url=${reqUrl} | status=${responseStatusCode ?? "?"}`,
+    );
     try {
-      const { body } = await cdpSession.send("Network.getResponseBody", { requestId });
-      const json = JSON.parse(body);
-      // Log tất cả top-level data keys để phát hiện API đổi tên
-      const dataKeys = Object.keys(json?.data ?? {}).join(", ");
-      console.error(`[syncInbox CDP]   data keys: ${dataKeys || "(trống)"}`);
-      const elements = json?.data?.messengerConversationsBySyncToken?.elements;
-      if (elements?.length > 0) {
+      if (responseStatusCode && responseStatusCode >= 200 && responseStatusCode < 300) {
+        let jsonStr;
+        try {
+          const { body, base64Encoded } = await cdpSession.send("Fetch.getResponseBody", {
+            requestId,
+          });
+          jsonStr = base64Encoded ? Buffer.from(body, "base64").toString("utf-8") : body;
+        } catch (bodyErr) {
+          console.error(
+            `[syncInbox Fetch #${fetchInterceptCount}] getResponseBody lỗi: ${bodyErr.message}`,
+          );
+          return;
+        }
+
+        let json;
+        try {
+          json = JSON.parse(jsonStr);
+        } catch {
+          return;
+        }
+
+        const dataKeys = Object.keys(json?.data ?? {}).join(", ");
         console.error(
-          `[syncInbox CDP]   messengerConversationsBySyncToken: ${elements.length} hội thoại`,
+          `[syncInbox Fetch #${fetchInterceptCount}] data keys: [${dataKeys || "(trống)"}]`,
         );
-        collectedConversations.push(json);
-      } else if (dataKeys) {
-        console.error(`[syncInbox CDP]   Không có messengerConversationsBySyncToken — bỏ qua`);
+
+        const elements = json?.data?.messengerConversationsBySyncToken?.elements;
+        if (Array.isArray(elements) && elements.length > 0) {
+          console.error(
+            `[syncInbox Fetch #${fetchInterceptCount}] messengerConversationsBySyncToken: ${elements.length} hội thoại`,
+          );
+          collectedConversations.push(json);
+        } else if (dataKeys) {
+          console.error(
+            `[syncInbox Fetch #${fetchInterceptCount}] Không có messengerConversationsBySyncToken — bỏ qua`,
+          );
+        }
       }
     } catch (e) {
-      graphqlBodyErrors++;
-      console.error(`[syncInbox CDP]   Lỗi đọc body #${graphqlBodyErrors}: ${e.message}`);
+      console.error(`[syncInbox Fetch #${fetchInterceptCount}] lỗi xử lý: ${e.message}`);
+    } finally {
+      await cdpSession.send("Fetch.continueRequest", { requestId }).catch((e) => {
+        console.error(`[syncInbox Fetch] continueRequest lỗi: ${e.message}`);
+      });
     }
   });
 
@@ -1410,9 +1443,9 @@ async function linkedinSyncInbox(cdpUrl) {
     // Đợi thêm để thu thập phản hồi API cuối cùng sau scroll
     await sleep(2000);
 
-    // Tổng kết CDP
+    // Tổng kết Fetch intercept
     console.error(
-      `[syncInbox CDP] Tổng: ${graphqlHits} GraphQL hit, ${graphqlBodyErrors} lỗi đọc body, ${collectedConversations.length} batch hợp lệ`,
+      `[syncInbox Fetch] Tổng: ${fetchInterceptCount} intercept, ${collectedConversations.length} batch hợp lệ`,
     );
 
     // Fallback DOM nếu CDP không bắt được response nào
@@ -1511,25 +1544,40 @@ async function linkedinListenNewMessages(cdpUrl) {
 
   const rawElements = [];
   const cdpSession = await context.newCDPSession(listenPage);
-  await cdpSession.send("Network.enable");
-  let graphqlHits = 0;
+  await cdpSession.send("Fetch.enable", {
+    patterns: [
+      { urlPattern: "*voyagerMessagingGraphQL*", requestStage: "Response" },
+      { urlPattern: "*voyager/api/messaging*", requestStage: "Response" },
+    ],
+  });
+  let fetchInterceptCount = 0;
 
-  cdpSession.on("Network.responseReceived", async ({ requestId, response }) => {
-    const url = response.url;
-    if (!url.includes("voyagerMessagingGraphQL/graphql")) return;
-    graphqlHits++;
+  cdpSession.on("Fetch.requestPaused", async ({ requestId, request, responseStatusCode }) => {
+    fetchInterceptCount++;
     try {
-      const { body } = await cdpSession.send("Network.getResponseBody", { requestId });
-      const json = JSON.parse(body);
-      const elements = json?.data?.messengerConversationsBySyncToken?.elements;
-      if (Array.isArray(elements) && elements.length > 0) {
-        console.error(
-          `[listenInbox] messengerConversationsBySyncToken: ${elements.length} hội thoại`,
-        );
-        rawElements.push(...elements);
+      if (responseStatusCode && responseStatusCode >= 200 && responseStatusCode < 300) {
+        let json;
+        try {
+          const { body, base64Encoded } = await cdpSession.send("Fetch.getResponseBody", {
+            requestId,
+          });
+          const text = base64Encoded ? Buffer.from(body, "base64").toString("utf-8") : body;
+          json = JSON.parse(text);
+        } catch {
+          return;
+        }
+        const elements = json?.data?.messengerConversationsBySyncToken?.elements;
+        if (Array.isArray(elements) && elements.length > 0) {
+          console.error(
+            `[listenInbox] messengerConversationsBySyncToken: ${elements.length} hội thoại`,
+          );
+          rawElements.push(...elements);
+        }
       }
     } catch (e) {
-      console.error(`[listenInbox] Lỗi đọc body: ${e.message}`);
+      console.error(`[listenInbox] Lỗi xử lý: ${e.message}`);
+    } finally {
+      await cdpSession.send("Fetch.continueRequest", { requestId }).catch(() => {});
     }
   });
 
@@ -1554,7 +1602,9 @@ async function linkedinListenNewMessages(cdpUrl) {
     // Đợi API load — không cần scroll, chỉ cần batch đầu tiên
     await sleep(6000);
 
-    console.error(`[listenInbox] ${graphqlHits} GraphQL hit, ${rawElements.length} conv raw`);
+    console.error(
+      `[listenInbox] ${fetchInterceptCount} Fetch intercept, ${rawElements.length} conv raw`,
+    );
 
     // Parse thành danh sách flat
     const seen = new Set();
