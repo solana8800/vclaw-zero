@@ -112,7 +112,8 @@ export default {
           },
           threadId: {
             type: "string",
-            description: "ID hội thoại LinkedIn (dùng cho sync_thread)",
+            description:
+              "ID hội thoại LinkedIn (dùng cho sync_thread hoặc gửi tin nhắn vào thread đã biết)",
           },
         },
         required: ["action"],
@@ -141,7 +142,14 @@ export default {
             break;
           case "send_message":
           case "linkedin_send_message":
-            scriptArgs.push("send_message", "--url", args.profile_url, "--message", args.message);
+            scriptArgs.push(
+              "send_message",
+              "--url",
+              args.profile_url,
+              "--message",
+              args.message,
+              ...(args.threadId ? ["--thread-id", args.threadId] : []),
+            );
             break;
           case "send_connect":
           case "linkedin_send_connect":

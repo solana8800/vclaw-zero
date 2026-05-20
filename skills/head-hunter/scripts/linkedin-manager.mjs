@@ -24,6 +24,10 @@ import {
   linkedInProfileActionElementSelector,
   linkedInSendInvitationButtonName,
 } from "./linkedin-action-selectors.mjs";
+import {
+  buildLinkedInDashMessageRequest,
+  parseLinkedInMessagingThreadId,
+} from "./linkedin-voyager-message.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SESSION_FILE = path.join(os.homedir(), ".openclaw", "workspace", "linkedin-session.json");
@@ -41,6 +45,7 @@ function parseCli(argv) {
     companyUrl: null,
     target: null,
     imagePath: null,
+    threadId: null,
     cdpUrl: process.env.LINKEDIN_CDP_URL || "http://127.0.0.1:9222",
   };
   while (args.length) {
@@ -54,6 +59,7 @@ function parseCli(argv) {
     else if (a === "--company-url") out.companyUrl = args.shift() ?? null;
     else if (a === "--target") out.target = args.shift() ?? null;
     else if (a === "--image-path") out.imagePath = args.shift() ?? null;
+    else if (a === "--thread-id" || a === "--threadId") out.threadId = args.shift() ?? null;
     else if (a === "--cdp-url") out.cdpUrl = args.shift() ?? out.cdpUrl;
   }
   return out;
@@ -1146,6 +1152,238 @@ async function clickSendMessage(page) {
   return false;
 }
 
+/**
+ * Gửi tin nhắn qua LinkedIn Voyager API (internal REST) — inject fetch() vào browser context.
+ * Không navigate, không click, không type — ít bị detect hơn nhiều so với DOM automation.
+ * profileIdUrl phải dạng /in/ACoAAA... (ID-based URL từ GraphQL).
+ */
+async function linkedinSendMessageVoyager(profileIdUrl, message, cdpUrl, knownThreadId = null) {
+  let profileUrl = (profileIdUrl || "").split("?")[0];
+  const idMatch = profileUrl.match(/\/in\/([^/?#\s]+)/);
+  if (!idMatch) {
+    return { success: false, error: "profileIdUrl không chứa /in/<id>" };
+  }
+  if (!profileUrl.startsWith("http")) {
+    profileUrl = `https://www.linkedin.com${profileUrl.startsWith("/") ? profileUrl : `/in/${profileUrl}`}`;
+  }
+
+  const { browser, page: rawPage } = await connectPage(cdpUrl);
+  // Kiểm tra page còn sống không; nếu không thì dùng trang mới
+  let page = rawPage;
+  try {
+    await page.evaluate(() => true);
+  } catch {
+    console.error("[sendVoyager] page cũ dead — tạo trang mới");
+    page = await browser.contexts()[0].newPage();
+  }
+  try {
+    if (knownThreadId) {
+      const threadUrl = `https://www.linkedin.com/messaging/thread/${encodeURIComponent(knownThreadId)}/`;
+      console.error(`[sendVoyager] mở thẳng LinkedIn thread từ DB: ${knownThreadId}`);
+      await page.goto(threadUrl, { timeout: 60_000 });
+    } else {
+      await page.goto(profileUrl, { timeout: 60_000 });
+    }
+    await page.waitForLoadState("domcontentloaded").catch(() => null);
+    await sleep(1500);
+
+    const currentUrl = page.url();
+    if (pageLooksLikeLoginWall(currentUrl)) {
+      return { success: false, error: "Chưa đăng nhập LinkedIn trên Chrome CDP." };
+    }
+
+    let openedThread = knownThreadId || parseLinkedInMessagingThreadId(currentUrl);
+    if (!openedThread) {
+      let clickedMessage = false;
+      for (let i = 0; i < 3; i++) {
+        clickedMessage = await page
+          .evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+            const msgBtn = btns.find((b) => {
+              const text = (b.innerText || b.textContent || "").trim().toLowerCase();
+              return (
+                text === "message" ||
+                text === "nhắn tin" ||
+                text.startsWith("message ") ||
+                text.startsWith("nhắn tin ")
+              );
+            });
+            if (msgBtn) {
+              msgBtn.click();
+              return true;
+            }
+            return false;
+          })
+          .catch(() => false);
+
+        if (clickedMessage) break;
+
+        if (i === 0) {
+          await page
+            .evaluate(() => {
+              const moreBtns = Array.from(document.querySelectorAll("button, a"));
+              const moreBtn = moreBtns.find((b) => {
+                const t = (b.innerText || b.getAttribute("aria-label") || "").trim().toLowerCase();
+                return (
+                  t === "more" || t === "thêm" || t === "more actions" || t === "các hành động khác"
+                );
+              });
+              if (moreBtn) moreBtn.click();
+            })
+            .catch(() => {});
+        }
+        await sleep(1200);
+      }
+
+      if (!clickedMessage) {
+        return {
+          success: false,
+          error:
+            "Không tìm thấy nút 'Nhắn tin' (Message) trên profile. Có thể bạn chưa kết nối với ứng viên này trên LinkedIn.",
+        };
+      }
+
+      await sleep(2500);
+      openedThread = parseLinkedInMessagingThreadId(page.url());
+      if (!openedThread) {
+        const firstThreadLink = page.locator("a[href*='/messaging/thread/']").first();
+        if (await firstThreadLink.count()) {
+          const href = await firstThreadLink.getAttribute("href");
+          if (href) {
+            await page.goto(href.startsWith("http") ? href : `https://www.linkedin.com${href}`, {
+              timeout: 25_000,
+            });
+            await page.waitForLoadState("domcontentloaded").catch(() => null);
+            await sleep(1000);
+            openedThread = parseLinkedInMessagingThreadId(page.url());
+          }
+        }
+      }
+    }
+
+    if (!openedThread) {
+      return { success: false, error: "Không lấy được LinkedIn messaging thread id." };
+    }
+
+    const requestContext = await page.evaluate((threadId) => {
+      const getCsrf = () => {
+        const m = document.cookie.match(/JSESSIONID[=:]"?([^";,\s]+)"?/);
+        return m ? m[1] : null;
+      };
+      const getMeta = (name) => document.querySelector(`meta[name="${name}"]`)?.content || null;
+      const randomToken = () =>
+        crypto.randomUUID?.() ||
+        "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+          const r = crypto.getRandomValues(new Uint8Array(1))[0] & 15;
+          const v = c === "x" ? r : (r & 3) | 8;
+          return v.toString(16);
+        });
+      const randomTrackingId = () =>
+        String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)));
+      const findMailboxUrn = () => {
+        const html = document.documentElement.innerHTML;
+        const escapedThreadId = threadId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const conversationMatch = html.match(
+          new RegExp(
+            `urn:li:msg_conversation:\\\\?\\((urn:li:fsd_profile:[^,)"]+),${escapedThreadId}`,
+          ),
+        );
+        if (conversationMatch?.[1]) return conversationMatch[1];
+        const mailboxMatch = html.match(/"mailboxUrn"\s*:\s*"(urn:li:fsd_profile:[^"]+)"/);
+        if (mailboxMatch?.[1]) return mailboxMatch[1];
+        const profileMatch = html.match(/urn:li:fsd_profile:[A-Za-z0-9_-]+/);
+        return profileMatch?.[0] || null;
+      };
+      const findPageInstance = () => {
+        const html = document.documentElement.innerHTML;
+        const pageInstances = [
+          ...new Set([...html.matchAll(/urn:li:page:[^"'\\<\s]+/g)].map((m) => m[0])),
+        ];
+        return (
+          pageInstances.find((value) =>
+            value.includes("d_flagship3_messaging_conversation_detail"),
+          ) ||
+          pageInstances.find((value) => value.includes("messaging")) ||
+          getMeta("bprPageInstance")
+        );
+      };
+      const csrf = getCsrf();
+      if (!csrf) return { error: "Không tìm thấy CSRF token (JSESSIONID) trong cookie" };
+      const mailboxUrn = findMailboxUrn();
+      if (!mailboxUrn) return { error: "Không tìm thấy mailboxUrn LinkedIn" };
+
+      const liLang = getMeta("i18nLocale") || navigator.language || "en_US";
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const tzOffset = -new Date().getTimezoneOffset() / 60;
+      const serviceVersion = getMeta("serviceVersion");
+      const clientVersion =
+        serviceVersion ||
+        window.__APP_VERSION__ ||
+        document.querySelector("meta[name='version']")?.content ||
+        "1.13.20537";
+      const liTrack = {
+        clientVersion,
+        mpVersion: clientVersion,
+        osName: "web",
+        timezoneOffset: tzOffset,
+        timezone: tz,
+        deviceFormFactor: "DESKTOP",
+        mpName: "voyager-web",
+        displayDensity: window.devicePixelRatio || 1,
+        displayWidth: window.screen.width,
+        displayHeight: window.screen.height,
+      };
+      const pageInstance = findPageInstance();
+
+      return {
+        csrfToken: csrf,
+        language: liLang,
+        liTrack,
+        mailboxUrn,
+        originToken: randomToken(),
+        pageInstance,
+        trackingId: randomTrackingId(),
+      };
+    }, openedThread);
+
+    if (requestContext.error) {
+      return { success: false, error: requestContext.error };
+    }
+
+    const request = buildLinkedInDashMessageRequest({
+      message,
+      threadId: openedThread,
+      ...requestContext,
+    });
+    const result = await page.evaluate(async (req) => {
+      try {
+        const resp = await fetch(req.url, {
+          method: "POST",
+          credentials: "include",
+          headers: req.headers,
+          body: req.body,
+        });
+
+        if (!resp.ok) {
+          const txt = await resp.text().catch(() => "");
+          return { success: false, error: `HTTP ${resp.status}: ${txt.slice(0, 300)}` };
+        }
+        const data = await resp.json().catch(() => null);
+        return { success: true, _method: "voyager_dash", messageUrn: data?.value?.entityUrn };
+      } catch (err) {
+        return { success: false, error: err.message };
+      }
+    }, request);
+
+    console.error(`[sendVoyager] ${result.success ? "✓ OK" : "✗ FAIL"} → ${result.error ?? ""}`);
+    return result;
+  } catch (e) {
+    return { success: false, error: `Voyager exception: ${e.message}` };
+  } finally {
+    await releaseCdpBrowser(browser);
+  }
+}
+
 async function linkedinSendMessage(url, message, cdpUrl) {
   console.error(`--- Gửi tin nhắn LinkedIn: ${url} ---`);
   let profileUrl = (url || "").split("?")[0];
@@ -1812,7 +2050,27 @@ async function main() {
         console.error("Error: --url và --message bắt buộc");
         process.exit(1);
       }
-      console.log(JSON.stringify(await linkedinSendMessage(url, message, cdpUrl), null, 2));
+      // Thử Voyager API trước (không navigate, không click — ít bị detect)
+      console.error(
+        `[send_message] Thử Voyager API cho: ${url}${cli.threadId ? ` thread=${cli.threadId}` : ""}`,
+      );
+      let result = await linkedinSendMessageVoyager(url, message, cdpUrl, cli.threadId);
+      let usedMethod = "voyager";
+      if (result.success) {
+        console.error(`[send_message] ✓ Voyager API thành công — không cần navigate/click`);
+      } else {
+        console.error(`[send_message] ✗ Voyager thất bại: ${result.error}`);
+        console.error(`[send_message] Fallback sang DOM automation (navigate + click)...`);
+        // result = await linkedinSendMessage(url, message, cdpUrl);
+        usedMethod = "dom";
+        if (result.success) {
+          console.error(`[send_message] ✓ DOM fallback thành công`);
+        } else {
+          console.error(`[send_message] ✗ DOM fallback cũng thất bại: ${result.error}`);
+        }
+      }
+      result._method = result.success ? usedMethod : "failed";
+      console.log(JSON.stringify(result, null, 2));
     } else if (action === "send_connect") {
       if (!url) {
         console.error("Error: --url bắt buộc");
