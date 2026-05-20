@@ -1538,12 +1538,11 @@ async function linkedinSyncInbox(cdpUrl) {
 // ============================================================
 async function linkedinListenNewMessages(cdpUrl) {
   console.error("--- Kiểm tra tin nhắn mới LinkedIn Inbox ---");
-  const { browser } = await connectPage(cdpUrl);
-  const context = browser.contexts()[0];
-  const listenPage = await context.newPage();
+  // Dùng existing page (giống syncInbox) thay vì newPage() — tránh load LinkedIn từ đầu quá chậm
+  const { browser, page } = await connectPage(cdpUrl);
 
   const rawElements = [];
-  const cdpSession = await context.newCDPSession(listenPage);
+  const cdpSession = await page.context().newCDPSession(page);
   await cdpSession.send("Fetch.enable", {
     patterns: [
       { urlPattern: "*voyagerMessagingGraphQL*", requestStage: "Response" },
@@ -1582,12 +1581,12 @@ async function linkedinListenNewMessages(cdpUrl) {
   });
 
   try {
-    await listenPage.goto("https://www.linkedin.com/messaging/", {
+    await page.goto("https://www.linkedin.com/messaging/", {
       timeout: 60_000,
       waitUntil: "domcontentloaded",
     });
 
-    const currentUrl = listenPage.url();
+    const currentUrl = page.url();
     if (
       currentUrl.includes("/login") ||
       currentUrl.includes("/signup") ||
@@ -1595,12 +1594,13 @@ async function linkedinListenNewMessages(cdpUrl) {
     ) {
       return {
         success: false,
+        conversations: [],
         error: "Phiên đăng nhập LinkedIn đã hết hạn hoặc chưa kết nối.",
       };
     }
 
-    // Đợi API load — không cần scroll, chỉ cần batch đầu tiên
-    await sleep(6000);
+    // Tin nhắn mới luôn nằm đầu batch đầu tiên — không cần scroll
+    await sleep(5000);
 
     console.error(
       `[listenInbox] ${fetchInterceptCount} Fetch intercept, ${rawElements.length} conv raw`,
@@ -1620,7 +1620,6 @@ async function linkedinListenNewMessages(cdpUrl) {
       const deliveredAt = typeof lastMsg.deliveredAt === "number" ? lastMsg.deliveredAt : null;
       const fromSelf = lastMsg.actor?.participantType?.member?.distance === "SELF";
 
-      // Người gửi (bên kia hội thoại, không phải mình)
       const senderMember = conv.conversationParticipants?.find(
         (p) => p.participantType?.member?.distance !== "SELF",
       )?.participantType?.member;
@@ -1646,10 +1645,13 @@ async function linkedinListenNewMessages(cdpUrl) {
     console.error(`[listenInbox] Parsed ${conversations.length} hội thoại`);
     return { success: true, conversations };
   } catch (err) {
-    return { success: false, error: `Lỗi khi lắng nghe tin nhắn: ${err.message}` };
+    return {
+      success: false,
+      conversations: [],
+      error: `Lỗi khi lắng nghe tin nhắn: ${err.message}`,
+    };
   } finally {
     await cdpSession.detach().catch(() => {});
-    await listenPage.close().catch(() => {});
     await releaseCdpBrowser(browser);
   }
 }
