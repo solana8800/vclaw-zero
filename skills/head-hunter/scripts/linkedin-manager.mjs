@@ -65,7 +65,15 @@ function parseCli(argv) {
   return out;
 }
 
-async function connectPage(cdpUrl) {
+function isVclawAppPage(url) {
+  return /^https?:\/\/(?:127\.0\.0\.1|localhost):\d+(?:\/|$)/.test(url);
+}
+
+function isLinkedInPage(url) {
+  return /^https?:\/\/(?:[\w-]+\.)?linkedin\.com(?:\/|$)/i.test(url);
+}
+
+async function connectBrowser(cdpUrl) {
   const base = cdpUrl.replace(/\/$/, "");
   try {
     const res = await fetch(`${base}/json/version`);
@@ -75,13 +83,73 @@ async function connectPage(cdpUrl) {
     if (!wsUrl) throw new Error("Phản hồi CDP thiếu webSocketDebuggerUrl");
     const browser = await chromium.connectOverCDP(wsUrl);
     const context = browser.contexts()[0] ?? (await browser.newContext());
-    let page = context.pages()[0];
-    if (!page) page = await context.newPage();
-    return { browser, page };
+    return { browser, context };
   } catch (e) {
     throw new Error(
       `Không thể kết nối Chrome (CDP: ${base}). Hãy đảm bảo Chrome đang chạy với --remote-debugging-port=9222. Chi tiết: ${e.message}`,
     );
+  }
+}
+
+function pickAutomationPage(context) {
+  const pages = context.pages();
+  return (
+    pages.find((candidate) => isLinkedInPage(candidate.url())) ??
+    pages.find((candidate) => {
+      const url = candidate.url();
+      return url === "about:blank" || !isVclawAppPage(url);
+    }) ??
+    null
+  );
+}
+
+async function openAutomationPageFromApp(context, url) {
+  const appPage = context.pages().find((candidate) => isVclawAppPage(candidate.url()));
+  if (!appPage) {
+    throw new Error("Không tìm thấy cửa sổ VClaw để mở cửa sổ LinkedIn riêng.");
+  }
+
+  const popupPromise = context.waitForEvent("page", { timeout: 10_000 }).catch(() => null);
+  await appPage.evaluate((targetUrl) => {
+    window.open(targetUrl, "_blank", "popup=yes,width=980,height=720,left=80,top=80");
+  }, url);
+  return (await popupPromise) ?? pickAutomationPage(context);
+}
+
+async function connectPage(cdpUrl) {
+  const { browser, context } = await connectBrowser(cdpUrl);
+  try {
+    let page = pickAutomationPage(context);
+    if (!page) {
+      page = await openAutomationPageFromApp(context, "https://www.linkedin.com/feed/");
+    }
+    if (!page) {
+      throw new Error("Không mở được cửa sổ LinkedIn riêng.");
+    }
+    await page.bringToFront().catch(() => {});
+    return { browser, page };
+  } catch (e) {
+    await releaseCdpBrowser(browser).catch(() => {});
+    throw e;
+  }
+}
+
+async function connectOrOpenPage(cdpUrl, url) {
+  const { browser, context } = await connectBrowser(cdpUrl);
+  try {
+    let page = pickAutomationPage(context);
+    if (!page) {
+      page = await openAutomationPageFromApp(context, url);
+    }
+
+    if (!page) {
+      throw new Error("Không mở được cửa sổ LinkedIn riêng.");
+    }
+    await page.bringToFront().catch(() => {});
+    return { browser, page };
+  } catch (e) {
+    await releaseCdpBrowser(browser).catch(() => {});
+    throw e;
   }
 }
 
@@ -1520,7 +1588,7 @@ async function linkedinSendMessageVoyager(profileIdUrl, message, cdpUrl, knownTh
 // ============================================================
 async function openBrowserUrl(url, cdpUrl) {
   console.error(`--- Mở trình duyệt tại: ${url} ---`);
-  const { browser, page } = await connectPage(cdpUrl);
+  const { browser, page } = await connectOrOpenPage(cdpUrl, url);
   try {
     await page.goto(url, { timeout: 60_000 });
     return { success: true, message: "Trình duyệt đã được mở. Vui lòng đăng nhập." };

@@ -1,6 +1,7 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * recruitment-bridge — Plugin Gateway
@@ -31,26 +32,59 @@ async function pushToVClaw(action: string, data: Record<string, unknown>) {
 }
 
 function runScript(params: { cwd: string; command: string; args: string[] }) {
-  const result = spawnSync(params.command, params.args, {
-    cwd: params.cwd,
-    env: process.env,
-    encoding: "utf-8",
+  return new Promise<any>((resolve, reject) => {
+    const child = spawn(params.command, params.args, {
+      cwd: params.cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        resolve({ success: false, error: stderr || stdout || "Unknown error" });
+        return;
+      }
+
+      try {
+        resolve({ success: true, data: JSON.parse(stdout) });
+      } catch {
+        resolve({ success: true, data: stdout });
+      }
+    });
   });
-
-  if (result.error) throw result.error;
-
-  if (result.status !== 0) {
-    return { success: false, error: result.stderr || result.stdout || "Unknown error" };
-  }
-
-  try {
-    return { success: true, data: JSON.parse(result.stdout) };
-  } catch {
-    return { success: true, data: result.stdout };
-  }
 }
 
-const SKILLS_DIR = path.join(process.cwd(), "skills");
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+function resolveHeadHunterScriptPath() {
+  const candidates = [
+    path.join(process.cwd(), "skills", "head-hunter", "scripts", "linkedin-manager.mjs"),
+    path.join(MODULE_DIR, "..", "..", "skills", "head-hunter", "scripts", "linkedin-manager.mjs"),
+    path.join(
+      MODULE_DIR,
+      "..",
+      "..",
+      "..",
+      "skills",
+      "head-hunter",
+      "scripts",
+      "linkedin-manager.mjs",
+    ),
+  ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
+}
 
 export default {
   id: "recruitment-bridge",
@@ -119,7 +153,7 @@ export default {
 
       async execute(_toolCallId: string, params: any) {
         const { action, jobPositionId, ...args } = params;
-        const scriptPath = path.join(SKILLS_DIR, "head-hunter", "scripts", "linkedin-manager.mjs");
+        const scriptPath = resolveHeadHunterScriptPath();
 
         if (!fs.existsSync(scriptPath)) {
           throw new Error("Script linkedin-manager.mjs không tìm thấy.");
@@ -190,8 +224,8 @@ export default {
             throw new Error(`Action không hợp lệ: ${action}`);
         }
 
-        const result = runScript({
-          cwd: path.join(SKILLS_DIR, "head-hunter"),
+        const result = await runScript({
+          cwd: path.dirname(path.dirname(scriptPath)),
           command: process.execPath,
           args: scriptArgs,
         });
