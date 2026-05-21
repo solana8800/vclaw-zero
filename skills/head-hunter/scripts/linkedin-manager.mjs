@@ -2,6 +2,7 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { fileURLToPath } from "url";
 /**
  * Điều phối LinkedIn qua Chrome CDP (playwright-core).
  * Chạy từ thư mục skill: node scripts/linkedin-manager.mjs <action> [options]
@@ -24,11 +25,8 @@ import {
   linkedInProfileActionElementSelector,
   linkedInSendInvitationButtonName,
 } from "./linkedin-action-selectors.mjs";
-import {
-  extractProfileBasicsFromText,
-  extractProfileSectionItemsFromText,
-  extractProfileSectionTextFromText,
-} from "./linkedin-profile-extractors.mjs";
+import { applyLinkedInProfileExtractionTemplate } from "./linkedin-profile-extractors.mjs";
+import { applyLinkedInSearchExtractionTemplate } from "./linkedin-search-extractors.mjs";
 import {
   buildLinkedInDashMessageRequest,
   parseLinkedInMessagingThreadId,
@@ -40,6 +38,22 @@ import {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SESSION_FILE = path.join(os.homedir(), ".openclaw", "workspace", "linkedin-session.json");
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const LINKEDIN_TEMPLATES_FILE = path.resolve(
+  SCRIPT_DIR,
+  "..",
+  "templates",
+  "linkedin",
+  "linkedin-templates.v1.json",
+);
+let cachedLinkedInTemplates = null;
+
+function loadLinkedInTemplate(name) {
+  if (!cachedLinkedInTemplates) {
+    cachedLinkedInTemplates = JSON.parse(fs.readFileSync(LINKEDIN_TEMPLATES_FILE, "utf8"));
+  }
+  return cachedLinkedInTemplates?.templates?.[name] ?? null;
+}
 
 function parseCli(argv) {
   const args = [...argv];
@@ -547,38 +561,64 @@ async function linkedinSearch(query, cdpUrl) {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
     await sleep(3000);
 
-    let selectors = await page.locator(".reusable-search__result-container").all();
+    const searchTemplate = loadLinkedInTemplate("searchPeople") || {};
+    const cardSelectors = Array.isArray(searchTemplate.cardSelectors)
+      ? searchTemplate.cardSelectors
+      : [];
+    let selectors = [];
+    for (const selector of cardSelectors) {
+      selectors = await page.locator(selector).all();
+      if (selectors.length) break;
+    }
+    if (selectors.length === 0)
+      selectors = await page.locator(".reusable-search__result-container").all();
     if (selectors.length === 0) selectors = await page.locator(".entity-result").all();
     if (selectors.length === 0) selectors = await page.locator("div:has(a[href*='/in/'])").all();
 
     console.error(`--- Tìm thấy ${selectors.length} thẻ DOM ---`);
 
+    const templatedResults = await applyLinkedInSearchExtractionTemplate({
+      template: searchTemplate,
+      cards: selectors,
+    });
+
     const seen = new Set();
     const results = [];
-    for (const sel of selectors) {
+    for (const [index, sel] of selectors.entries()) {
       if (results.length >= LINKEDIN_SEARCH_MAX) break;
+      const templatedResult = templatedResults[index] || {};
       try {
-        let nameEl = sel.locator(".entity-result__title-text a, .actor-name").first();
-        if (!(await nameEl.count())) nameEl = sel.locator("a[href*='/in/']").first();
-        if (!(await nameEl.count())) continue;
+        let name = templatedResult.name || "N/A";
+        let href = templatedResult.profile_url || null;
+        if (!href) {
+          let nameEl = sel.locator(".entity-result__title-text a, .actor-name").first();
+          if (!(await nameEl.count())) nameEl = sel.locator("a[href*='/in/']").first();
+          if (!(await nameEl.count())) continue;
 
-        const name = (await nameEl.innerText()).split("\n")[0].trim();
-        let href = await nameEl.getAttribute("href");
+          name = (await nameEl.innerText()).split("\n")[0].trim();
+          href = await nameEl.getAttribute("href");
+        }
         if (!href) continue;
         let profileUrl = href.split("?")[0];
         if (!profileUrl.startsWith("http")) profileUrl = `https://www.linkedin.com${profileUrl}`;
         if (!profileUrl.includes("/in/") || seen.has(profileUrl)) continue;
         seen.add(profileUrl);
 
-        const headlineEl = sel
-          .locator(".entity-result__primary-subtitle, .subline-level-1")
-          .first();
-        const headline = (await headlineEl.count()) ? (await headlineEl.innerText()).trim() : "N/A";
+        let headline = templatedResult.headline || "N/A";
+        if (headline === "N/A") {
+          const headlineEl = sel
+            .locator(".entity-result__primary-subtitle, .subline-level-1")
+            .first();
+          headline = (await headlineEl.count()) ? (await headlineEl.innerText()).trim() : "N/A";
+        }
 
-        const locationEl = sel
-          .locator(".entity-result__secondary-subtitle, .subline-level-2")
-          .first();
-        const location = (await locationEl.count()) ? (await locationEl.innerText()).trim() : "N/A";
+        let location = templatedResult.location || "N/A";
+        if (location === "N/A") {
+          const locationEl = sel
+            .locator(".entity-result__secondary-subtitle, .subline-level-2")
+            .first();
+          location = (await locationEl.count()) ? (await locationEl.innerText()).trim() : "N/A";
+        }
 
         results.push({
           name,
@@ -736,16 +776,6 @@ async function linkedinGetProfile(url, cdpUrl) {
         location = (await locationEl.innerText()).trim().split("\n")[0];
       }
 
-      const invalidName = name === "N/A" || /^\d+$/.test(name) || /^notifications?$/i.test(name);
-      const invalidHeadline =
-        headline === "N/A" || /^\d+$/.test(headline) || /^notifications?$/i.test(headline);
-      if (invalidName || invalidHeadline || location === "N/A") {
-        const fallbackBasics = extractProfileBasicsFromText(pageText);
-        if (invalidName) name = fallbackBasics.name;
-        if (invalidHeadline) headline = fallbackBasics.headline;
-        if (location === "N/A") location = fallbackBasics.location;
-      }
-
       const avatarEl = page
         .locator(
           "img.pv-top-card-profile-picture__image, .feed-identity-module__actor-meta img, img.profile-photo-edit__preview",
@@ -785,43 +815,50 @@ async function linkedinGetProfile(url, cdpUrl) {
           .replace(/\s*xem thêm\s*$/gim, "")
           .trim();
       }
-      if (about === "N/A") {
-        about = extractProfileSectionTextFromText(pageText, "About") || "N/A";
-      }
 
       await scrollProfileForSections(page);
-      let [experiences, education, skills, projects, languages, recommendations] =
-        await Promise.all([
-          extractProfileListSection(page, "experience"),
-          extractProfileListSection(page, "education"),
-          extractProfileSkills(page),
-          extractProfileListSection(page, "projects"),
-          extractProfileListSection(page, "languages"),
-          extractProfileListSection(page, "recommendations"),
-        ]);
-      if (experiences.length === 0) {
-        experiences = extractProfileSectionItemsFromText(pageText, "Experience");
-      }
-      if (education.length === 0) {
-        education = extractProfileSectionItemsFromText(pageText, "Education");
-      }
-      if (skills.length === 0) {
-        skills = extractProfileSectionItemsFromText(pageText, "Skills").flatMap((item) =>
-          item
-            .split(/[,•·|]/)
-            .map((part) => part.trim())
-            .filter((part) => part.length > 1 && part.length < 80),
-        );
-      }
-      if (projects.length === 0) {
-        projects = extractProfileSectionItemsFromText(pageText, "Projects");
-      }
-      if (languages.length === 0) {
-        languages = extractProfileSectionItemsFromText(pageText, "Languages");
-      }
-      if (recommendations.length === 0) {
-        recommendations = extractProfileSectionItemsFromText(pageText, "Recommendations");
-      }
+      const [
+        selectorExperiences,
+        selectorEducation,
+        selectorSkills,
+        selectorProjects,
+        selectorLanguages,
+        selectorRecommendations,
+      ] = await Promise.all([
+        extractProfileListSection(page, "experience"),
+        extractProfileListSection(page, "education"),
+        extractProfileSkills(page),
+        extractProfileListSection(page, "projects"),
+        extractProfileListSection(page, "languages"),
+        extractProfileListSection(page, "recommendations"),
+      ]);
+      const extractedProfile = await applyLinkedInProfileExtractionTemplate({
+        template: loadLinkedInTemplate("profile") || {},
+        page,
+        pageText,
+        selectorValues: {
+          name,
+          headline,
+          location,
+          about,
+          experiences: selectorExperiences,
+          education: selectorEducation,
+          skills: selectorSkills,
+          projects: selectorProjects,
+          languages: selectorLanguages,
+          recommendations: selectorRecommendations,
+        },
+      });
+      name = extractedProfile.name ?? "N/A";
+      headline = extractedProfile.headline ?? "N/A";
+      location = extractedProfile.location ?? "N/A";
+      about = extractedProfile.about ?? "N/A";
+      const experiences = extractedProfile.experiences ?? [];
+      const education = extractedProfile.education ?? [];
+      const skills = extractedProfile.skills ?? [];
+      const projects = extractedProfile.projects ?? [];
+      const languages = extractedProfile.languages ?? [];
+      const recommendations = extractedProfile.recommendations ?? [];
 
       let connectionStatus = "UNKNOWN";
       try {

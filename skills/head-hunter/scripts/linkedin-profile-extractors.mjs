@@ -20,6 +20,21 @@ function cleanLine(value) {
     .trim();
 }
 
+function normalizeSelectorList(selectorOrSelectors) {
+  if (Array.isArray(selectorOrSelectors)) {
+    return selectorOrSelectors.map(cleanLine).filter(Boolean);
+  }
+  const selector = cleanLine(selectorOrSelectors);
+  return selector ? [selector] : [];
+}
+
+function isEmptyValue(value) {
+  if (value == null) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  const text = cleanLine(value);
+  return !text || text === "N/A" || /^\d+$/.test(text) || /^notifications?$/i.test(text);
+}
+
 function textLines(text) {
   return String(text || "")
     .split(/\r?\n/)
@@ -127,4 +142,91 @@ export function extractProfileSectionItemsFromText(text, heading) {
   if (current.length) items.push(current.join(" ").trim());
 
   return [...new Set(items.filter((item) => item.length >= 12))].slice(0, 15);
+}
+
+async function readLocatorText(locator) {
+  const count = await locator.count().catch(() => 0);
+  if (!count) return undefined;
+  const text = await locator.innerText().catch(async () => locator.textContent().catch(() => ""));
+  const cleaned = cleanLine(text);
+  return cleaned || undefined;
+}
+
+async function readLocatorList(locator) {
+  const count = await locator.count().catch(() => 0);
+  if (!count) return [];
+  const texts = await locator
+    .allInnerTexts()
+    .catch(async () => locator.allTextContents().catch(() => []));
+  return texts.map(cleanLine).filter(Boolean);
+}
+
+async function runProfileTemplateStrategy(strategy, { page, pageText, selectorValues }) {
+  if (!strategy || typeof strategy !== "object") return undefined;
+  if (strategy.type === "cssText") {
+    if (!page?.locator) return undefined;
+    const selectors = normalizeSelectorList(strategy.selectors ?? strategy.selector);
+    for (const selector of selectors) {
+      const value = await readLocatorText(page.locator(selector).first());
+      if (!isEmptyValue(value)) return value;
+    }
+    return undefined;
+  }
+  if (strategy.type === "cssList") {
+    if (!page?.locator) return undefined;
+    const selectors = normalizeSelectorList(strategy.selectors ?? strategy.selector);
+    const out = [];
+    for (const selector of selectors) {
+      const values = await readLocatorList(page.locator(selector));
+      values.forEach((value) => out.push(value));
+    }
+    return out.length ? [...new Set(out)] : undefined;
+  }
+  if (strategy.type === "selectorValue") {
+    return selectorValues?.[strategy.key];
+  }
+  if (strategy.type === "selectorList") {
+    return selectorValues?.[strategy.key];
+  }
+  if (strategy.type === "profileBasic") {
+    return extractProfileBasicsFromText(pageText)[strategy.field];
+  }
+  if (strategy.type === "sectionText") {
+    return extractProfileSectionTextFromText(pageText, strategy.heading);
+  }
+  if (strategy.type === "sectionItems") {
+    return extractProfileSectionItemsFromText(pageText, strategy.heading);
+  }
+  if (strategy.type === "splitDelimited") {
+    const source = selectorValues?.[strategy.key];
+    const values = Array.isArray(source) ? source : [source];
+    return values
+      .flatMap((item) => String(item || "").split(/[,•·|]/))
+      .map((item) => item.trim())
+      .filter((item) => item.length > 1 && item.length < 80);
+  }
+  return undefined;
+}
+
+export async function applyLinkedInProfileExtractionTemplate({
+  template,
+  page,
+  pageText,
+  selectorValues = {},
+}) {
+  const fields = template?.fields && typeof template.fields === "object" ? template.fields : {};
+  const out = {};
+  for (const [fieldName, fieldConfig] of Object.entries(fields)) {
+    const strategies = Array.isArray(fieldConfig?.strategies) ? fieldConfig.strategies : [];
+    for (const strategy of strategies) {
+      const value = await runProfileTemplateStrategy(strategy, { page, pageText, selectorValues });
+      if (!isEmptyValue(value)) {
+        out[fieldName] = Array.isArray(value)
+          ? [...new Set(value.map((item) => cleanLine(item)).filter(Boolean))]
+          : cleanLine(value);
+        break;
+      }
+    }
+  }
+  return out;
 }

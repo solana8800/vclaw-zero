@@ -1,0 +1,205 @@
+{
+  "schemaVersion": 1,
+  "target": "linkedin",
+  "templates": {
+    "profile": {
+      "fields": {
+        "name": {
+          "strategies": [
+            {
+              "type": "cssText",
+              "selectors": ["h1.text-heading-xlarge", "main h1", "header h1"]
+            },
+            { "type": "selectorValue", "key": "name" },
+            { "type": "profileBasic", "field": "name" }
+          ]
+        },
+        "headline": {
+          "strategies": [
+            {
+              "type": "cssText",
+              "selectors": [
+                ".pv-top-card--list .text-body-medium",
+                ".pv-text-details__left-panel .text-body-medium",
+                "main .text-body-medium"
+              ]
+            },
+            { "type": "selectorValue", "key": "headline" },
+            { "type": "profileBasic", "field": "headline" }
+          ]
+        },
+        "location": {
+          "strategies": [
+            {
+              "type": "cssText",
+              "selectors": [
+                ".pv-top-card--list .text-body-small",
+                ".pv-text-details__left-panel .text-body-small",
+                "span.text-body-small.inline.t-black--light"
+              ]
+            },
+            { "type": "selectorValue", "key": "location" },
+            { "type": "profileBasic", "field": "location" }
+          ]
+        },
+        "about": {
+          "strategies": [
+            {
+              "type": "cssText",
+              "selectors": [
+                "section:has(#about) div.inline-show-more-text",
+                "#about ~ div.display-flex",
+                ".pv-about-section"
+              ]
+            },
+            { "type": "selectorValue", "key": "about" },
+            { "type": "sectionText", "heading": "About" }
+          ]
+        },
+        "experiences": {
+          "strategies": [
+            {
+              "type": "cssList",
+              "selectors": [
+                "section:has(#experience) li.pvs-list__paged-list-item",
+                "section:has(#experience) div.pvs-entity",
+                "section:has(#experience) div[data-view-name='profile-component-entity']"
+              ]
+            },
+            { "type": "selectorList", "key": "experiences" },
+            { "type": "sectionItems", "heading": "Experience" }
+          ]
+        },
+        "education": {
+          "strategies": [
+            {
+              "type": "cssList",
+              "selectors": [
+                "section:has(#education) li.pvs-list__paged-list-item",
+                "section:has(#education) div.pvs-entity",
+                "section:has(#education) div[data-view-name='profile-component-entity']"
+              ]
+            },
+            { "type": "selectorList", "key": "education" },
+            { "type": "sectionItems", "heading": "Education" }
+          ]
+        },
+        "skills": {
+          "strategies": [
+            {
+              "type": "cssList",
+              "selectors": [
+                "section:has(#skills) a[data-field='skill_card_skill_topic']",
+                "section:has(#skills) .pv-skill-category-entity__name-text",
+                "section:has(#skills) span.pvs-entity__text--bold"
+              ]
+            },
+            { "type": "selectorList", "key": "skills" },
+            { "type": "sectionItems", "heading": "Skills" },
+            { "type": "splitDelimited", "key": "skills" }
+          ]
+        },
+        "projects": {
+          "strategies": [
+            {
+              "type": "cssList",
+              "selectors": [
+                "section:has(#projects) li.pvs-list__paged-list-item",
+                "section:has(#projects) div.pvs-entity",
+                "section:has(#projects) div[data-view-name='profile-component-entity']"
+              ]
+            },
+            { "type": "selectorList", "key": "projects" },
+            { "type": "sectionItems", "heading": "Projects" }
+          ]
+        },
+        "languages": {
+          "strategies": [
+            {
+              "type": "cssList",
+              "selectors": [
+                "section:has(#languages) li.pvs-list__paged-list-item",
+                "section:has(#languages) div.pvs-entity",
+                "section:has(#languages) div[data-view-name='profile-component-entity']"
+              ]
+            },
+            { "type": "selectorList", "key": "languages" },
+            { "type": "sectionItems", "heading": "Languages" }
+          ]
+        },
+        "recommendations": {
+          "strategies": [
+            {
+              "type": "cssList",
+              "selectors": [
+                "section:has(#recommendations) li.pvs-list__paged-list-item",
+                "section:has(#recommendations) div.pvs-entity",
+                "section:has(#recommendations) div[data-view-name='profile-component-entity']"
+              ]
+            },
+            { "type": "selectorList", "key": "recommendations" },
+            { "type": "sectionItems", "heading": "Recommendations" }
+          ]
+        }
+      }
+    },
+    "searchPeople": {
+      "cardSelectors": [
+        "div[role='listitem'] > div[data-display-contents='true']",
+        ".reusable-search__result-container",
+        ".entity-result"
+      ],
+      "fields": {
+        "name": {
+          "strategies": [
+            {
+              "type": "domText",
+              "path": [0, 0, 0, 1, 0],
+              "trimDegree": true
+            },
+            {
+              "type": "cssText",
+              "selectors": ["p a[href*='/in/']", ".entity-result__title-text a", ".actor-name"]
+            }
+          ]
+        },
+        "headline": {
+          "strategies": [
+            {
+              "type": "domText",
+              "path": [0, 0, 0, 1, 1]
+            },
+            {
+              "type": "cssText",
+              "selectors": [".entity-result__primary-subtitle", ".subline-level-1"]
+            }
+          ]
+        },
+        "location": {
+          "strategies": [
+            {
+              "type": "domText",
+              "path": [0, 0, 0, 1, 2]
+            },
+            {
+              "type": "cssText",
+              "selectors": [".entity-result__secondary-subtitle", ".subline-level-2"]
+            }
+          ]
+        },
+        "profile_url": {
+          "strategies": [
+            {
+              "type": "domHref",
+              "path": [0, 0, 0, 1, 0, 0]
+            },
+            {
+              "type": "cssHref",
+              "selectors": ["p a[href*='/in/']", "a[href*='/in/']"]
+            }
+          ]
+        }
+      }
+    }
+  }
+}
