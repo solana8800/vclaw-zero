@@ -735,8 +735,24 @@ async function linkedinGetProfile(url, cdpUrl) {
   const { browser, page } = await connectPage(cdpUrl);
 
   try {
-    await page.goto(targetUrl, { timeout: 60_000 });
-    await page.waitForLoadState("networkidle").catch(() => null);
+    const currentUrlBefore = page.url();
+    let skipGoto = false;
+
+    if (!url && isLinkedInPage(currentUrlBefore)) {
+      if (pageLooksLikeLoginWall(currentUrlBefore)) {
+        console.error("Đang ở trang login, bỏ qua goto để tránh làm mất thao tác gõ (polling).");
+        skipGoto = true;
+      } else if (currentUrlBefore.includes("/feed")) {
+        skipGoto = true;
+      }
+    }
+
+    if (!skipGoto) {
+      await page.goto(targetUrl, { timeout: 60_000 });
+      await page.waitForLoadState("networkidle").catch(() => null);
+    } else {
+      await page.waitForLoadState("domcontentloaded").catch(() => null);
+    }
 
     const currentUrl = page.url();
     const onLoginWall =
@@ -843,68 +859,78 @@ async function linkedinGetProfile(url, cdpUrl) {
           .trim();
       }
 
-      await scrollProfileForSections(page);
-      const [
-        selectorExperiences,
-        selectorEducation,
-        selectorSkills,
-        selectorProjects,
-        selectorLanguages,
-        selectorRecommendations,
-      ] = await Promise.all([
-        extractProfileListSection(page, "experience"),
-        extractProfileListSection(page, "education"),
-        extractProfileSkills(page),
-        extractProfileListSection(page, "projects"),
-        extractProfileListSection(page, "languages"),
-        extractProfileListSection(page, "recommendations"),
-      ]);
-      const extractedProfile = await applyLinkedInProfileExtractionTemplate({
-        template: loadLinkedInTemplate("profile") || {},
-        page,
-        pageText,
-        selectorValues: {
-          name,
-          headline,
-          location,
-          about,
-          experiences: selectorExperiences,
-          education: selectorEducation,
-          skills: selectorSkills,
-          projects: selectorProjects,
-          languages: selectorLanguages,
-          recommendations: selectorRecommendations,
-        },
-      });
-      name = extractedProfile.name ?? "N/A";
-      headline = extractedProfile.headline ?? "N/A";
-      location = extractedProfile.location ?? "N/A";
-      about = extractedProfile.about ?? "N/A";
-      const experiences = extractedProfile.experiences ?? [];
-      const education = extractedProfile.education ?? [];
-      const skills = extractedProfile.skills ?? [];
-      const projects = extractedProfile.projects ?? [];
-      const languages = extractedProfile.languages ?? [];
-      const recommendations = extractedProfile.recommendations ?? [];
-
+      let experiences = [];
+      let education = [];
+      let skills = [];
+      let projects = [];
+      let languages = [];
+      let recommendations = [];
       let connectionStatus = "UNKNOWN";
-      try {
-        const connectBtn = profileAction(page, linkedInConnectButtonName)
-          .or(connectActionFallback(page))
-          .first();
-        const pendingBtn = page.getByRole("button", { name: linkedInPendingButtonName }).first();
-        const messageBtn = profileAction(page, linkedInMessageButtonName)
-          .or(messageActionFallback(page))
-          .first();
-        if (await messageBtn.isVisible().catch(() => false)) {
-          connectionStatus = "CONNECTED";
-        } else if (await pendingBtn.isVisible().catch(() => false)) {
-          connectionStatus = "PENDING";
-        } else if (await connectBtn.isVisible().catch(() => false)) {
-          connectionStatus = "NOT_CONNECTED";
+
+      if (url) {
+        // Chỉ cuộn và cào thông tin chi tiết (Kinh nghiệm, Học vấn, Kỹ năng,...) khi cào Profile ứng viên cụ thể
+        await scrollProfileForSections(page);
+        const [
+          selectorExperiences,
+          selectorEducation,
+          selectorSkills,
+          selectorProjects,
+          selectorLanguages,
+          selectorRecommendations,
+        ] = await Promise.all([
+          extractProfileListSection(page, "experience"),
+          extractProfileListSection(page, "education"),
+          extractProfileSkills(page),
+          extractProfileListSection(page, "projects"),
+          extractProfileListSection(page, "languages"),
+          extractProfileListSection(page, "recommendations"),
+        ]);
+        const extractedProfile = await applyLinkedInProfileExtractionTemplate({
+          template: loadLinkedInTemplate("profile") || {},
+          page,
+          pageText,
+          selectorValues: {
+            name,
+            headline,
+            location,
+            about,
+            experiences: selectorExperiences,
+            education: selectorEducation,
+            skills: selectorSkills,
+            projects: selectorProjects,
+            languages: selectorLanguages,
+            recommendations: selectorRecommendations,
+          },
+        });
+        name = extractedProfile.name ?? name;
+        headline = extractedProfile.headline ?? headline;
+        location = extractedProfile.location ?? location;
+        about = extractedProfile.about ?? about;
+        experiences = extractedProfile.experiences ?? [];
+        education = extractedProfile.education ?? [];
+        skills = extractedProfile.skills ?? [];
+        projects = extractedProfile.projects ?? [];
+        languages = extractedProfile.languages ?? [];
+        recommendations = extractedProfile.recommendations ?? [];
+
+        try {
+          const connectBtn = profileAction(page, linkedInConnectButtonName)
+            .or(connectActionFallback(page))
+            .first();
+          const pendingBtn = page.getByRole("button", { name: linkedInPendingButtonName }).first();
+          const messageBtn = profileAction(page, linkedInMessageButtonName)
+            .or(messageActionFallback(page))
+            .first();
+          if (await messageBtn.isVisible().catch(() => false)) {
+            connectionStatus = "CONNECTED";
+          } else if (await pendingBtn.isVisible().catch(() => false)) {
+            connectionStatus = "PENDING";
+          } else if (await connectBtn.isVisible().catch(() => false)) {
+            connectionStatus = "NOT_CONNECTED";
+          }
+        } catch {
+          /* bỏ qua */
         }
-      } catch {
-        /* bỏ qua */
       }
 
       // Lấy profileUrl từ currentUrl hoặc DOM (không dùng API interception)
