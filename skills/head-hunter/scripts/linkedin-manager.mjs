@@ -25,9 +25,18 @@ import {
   linkedInSendInvitationButtonName,
 } from "./linkedin-action-selectors.mjs";
 import {
+  extractProfileBasicsFromText,
+  extractProfileSectionItemsFromText,
+  extractProfileSectionTextFromText,
+} from "./linkedin-profile-extractors.mjs";
+import {
   buildLinkedInDashMessageRequest,
   parseLinkedInMessagingThreadId,
 } from "./linkedin-voyager-message.mjs";
+import {
+  buildLinkedInAutomationPopupFeatures,
+  shouldFocusLinkedInAutomationPage,
+} from "./linkedin-window-policy.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SESSION_FILE = path.join(os.homedir(), ".openclaw", "workspace", "linkedin-session.json");
@@ -110,13 +119,17 @@ async function openAutomationPageFromApp(context, url) {
   }
 
   const popupPromise = context.waitForEvent("page", { timeout: 10_000 }).catch(() => null);
-  await appPage.evaluate((targetUrl) => {
-    window.open(targetUrl, "_blank", "popup=yes,width=980,height=720,left=80,top=80");
-  }, url);
+  const features = buildLinkedInAutomationPopupFeatures();
+  await appPage.evaluate(
+    ({ targetUrl, popupFeatures }) => {
+      window.open(targetUrl, "_blank", popupFeatures);
+    },
+    { targetUrl: url, popupFeatures: features },
+  );
   return (await popupPromise) ?? pickAutomationPage(context);
 }
 
-async function connectPage(cdpUrl) {
+async function connectPage(cdpUrl, options = {}) {
   const { browser, context } = await connectBrowser(cdpUrl);
   try {
     let page = pickAutomationPage(context);
@@ -126,7 +139,9 @@ async function connectPage(cdpUrl) {
     if (!page) {
       throw new Error("Không mở được cửa sổ LinkedIn riêng.");
     }
-    await page.bringToFront().catch(() => {});
+    if (shouldFocusLinkedInAutomationPage(options)) {
+      await page.bringToFront().catch(() => {});
+    }
     return { browser, page };
   } catch (e) {
     await releaseCdpBrowser(browser).catch(() => {});
@@ -134,7 +149,7 @@ async function connectPage(cdpUrl) {
   }
 }
 
-async function connectOrOpenPage(cdpUrl, url) {
+async function connectOrOpenPage(cdpUrl, url, options = {}) {
   const { browser, context } = await connectBrowser(cdpUrl);
   try {
     let page = pickAutomationPage(context);
@@ -145,7 +160,9 @@ async function connectOrOpenPage(cdpUrl, url) {
     if (!page) {
       throw new Error("Không mở được cửa sổ LinkedIn riêng.");
     }
-    await page.bringToFront().catch(() => {});
+    if (shouldFocusLinkedInAutomationPage(options)) {
+      await page.bringToFront().catch(() => {});
+    }
     return { browser, page };
   } catch (e) {
     await releaseCdpBrowser(browser).catch(() => {});
@@ -693,6 +710,7 @@ async function linkedinGetProfile(url, cdpUrl) {
       let name = "N/A";
       let headline = "N/A";
       let avatarUrl = null;
+      const pageText = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
 
       const nameEl = page
         .locator(
@@ -716,6 +734,16 @@ async function linkedinGetProfile(url, cdpUrl) {
         .first();
       if (await locationEl.count()) {
         location = (await locationEl.innerText()).trim().split("\n")[0];
+      }
+
+      const invalidName = name === "N/A" || /^\d+$/.test(name) || /^notifications?$/i.test(name);
+      const invalidHeadline =
+        headline === "N/A" || /^\d+$/.test(headline) || /^notifications?$/i.test(headline);
+      if (invalidName || invalidHeadline || location === "N/A") {
+        const fallbackBasics = extractProfileBasicsFromText(pageText);
+        if (invalidName) name = fallbackBasics.name;
+        if (invalidHeadline) headline = fallbackBasics.headline;
+        if (location === "N/A") location = fallbackBasics.location;
       }
 
       const avatarEl = page
@@ -757,9 +785,12 @@ async function linkedinGetProfile(url, cdpUrl) {
           .replace(/\s*xem thêm\s*$/gim, "")
           .trim();
       }
+      if (about === "N/A") {
+        about = extractProfileSectionTextFromText(pageText, "About") || "N/A";
+      }
 
       await scrollProfileForSections(page);
-      const [experiences, education, skills, projects, languages, recommendations] =
+      let [experiences, education, skills, projects, languages, recommendations] =
         await Promise.all([
           extractProfileListSection(page, "experience"),
           extractProfileListSection(page, "education"),
@@ -768,6 +799,29 @@ async function linkedinGetProfile(url, cdpUrl) {
           extractProfileListSection(page, "languages"),
           extractProfileListSection(page, "recommendations"),
         ]);
+      if (experiences.length === 0) {
+        experiences = extractProfileSectionItemsFromText(pageText, "Experience");
+      }
+      if (education.length === 0) {
+        education = extractProfileSectionItemsFromText(pageText, "Education");
+      }
+      if (skills.length === 0) {
+        skills = extractProfileSectionItemsFromText(pageText, "Skills").flatMap((item) =>
+          item
+            .split(/[,•·|]/)
+            .map((part) => part.trim())
+            .filter((part) => part.length > 1 && part.length < 80),
+        );
+      }
+      if (projects.length === 0) {
+        projects = extractProfileSectionItemsFromText(pageText, "Projects");
+      }
+      if (languages.length === 0) {
+        languages = extractProfileSectionItemsFromText(pageText, "Languages");
+      }
+      if (recommendations.length === 0) {
+        recommendations = extractProfileSectionItemsFromText(pageText, "Recommendations");
+      }
 
       let connectionStatus = "UNKNOWN";
       try {
@@ -1588,7 +1642,7 @@ async function linkedinSendMessageVoyager(profileIdUrl, message, cdpUrl, knownTh
 // ============================================================
 async function openBrowserUrl(url, cdpUrl) {
   console.error(`--- Mở trình duyệt tại: ${url} ---`);
-  const { browser, page } = await connectOrOpenPage(cdpUrl, url);
+  const { browser, page } = await connectOrOpenPage(cdpUrl, url, { manual: true });
   try {
     await page.goto(url, { timeout: 60_000 });
     return { success: true, message: "Trình duyệt đã được mở. Vui lòng đăng nhập." };
