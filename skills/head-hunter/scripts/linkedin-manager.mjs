@@ -27,6 +27,7 @@ import {
 } from "./linkedin-action-selectors.mjs";
 import { applyLinkedInProfileExtractionTemplate } from "./linkedin-profile-extractors.mjs";
 import { applyLinkedInSearchExtractionTemplate } from "./linkedin-search-extractors.mjs";
+import { buildLinkedInConnectRequest } from "./linkedin-voyager-connect.mjs";
 import {
   buildLinkedInDashMessageRequest,
   parseLinkedInMessagingThreadId,
@@ -275,6 +276,32 @@ function messageActionFallback(page) {
       ].join(", "),
     )
     .first();
+}
+
+function normalizeLinkedInHref(href) {
+  const value = String(href || "").trim();
+  if (!value) return null;
+  if (value.startsWith("http://") || value.startsWith("https://")) return value;
+  if (value.startsWith("/")) return `https://www.linkedin.com${value}`;
+  return null;
+}
+
+function isLinkedInConnectInviteHref(href) {
+  const value = String(href || "");
+  return (
+    value.includes("/preload/custom-invite/") ||
+    value.includes("/mynetwork/invite-connect/connections/")
+  );
+}
+
+async function openConnectInviteFromLocator(page, locator) {
+  const href = normalizeLinkedInHref(await locator.getAttribute("href").catch(() => null));
+  if (!href || !isLinkedInConnectInviteHref(href)) return false;
+  console.error(`[sendConnect] mở form lời mời qua href: ${href}`);
+  await page.goto(href, { timeout: 60_000 });
+  await page.waitForLoadState("domcontentloaded").catch(() => null);
+  await sleep(1200);
+  return true;
 }
 
 /** Modal soạn bài đăng (không phải ô comment trên feed). */
@@ -1067,8 +1094,20 @@ async function clickConnectOnProfile(page) {
     .or(profileTextActionFallback(page, linkedInConnectLabelFragment))
     .first();
   if (await direct.isVisible({ timeout: 4000 }).catch(() => false)) {
-    await direct.click();
-    return true;
+    if (await openConnectInviteFromLocator(page, direct)) {
+      return true;
+    }
+    try {
+      await direct.click();
+      return true;
+    } catch (error) {
+      if (await openConnectInviteFromLocator(page, direct)) {
+        return true;
+      }
+      await direct.click({ force: true }).catch(() => {});
+      await sleep(1200);
+      return true;
+    }
   }
   const moreBtn = page
     .getByRole("button", { name: linkedInMoreButtonName })
@@ -1088,7 +1127,18 @@ async function clickConnectOnProfile(page) {
       .or(profileTextActionFallback(page, linkedInConnectLabelFragment))
       .first();
     if (await menuConnect.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await menuConnect.click();
+      if (await openConnectInviteFromLocator(page, menuConnect)) {
+        return true;
+      }
+      try {
+        await menuConnect.click();
+      } catch {
+        if (await openConnectInviteFromLocator(page, menuConnect)) {
+          return true;
+        }
+        await menuConnect.click({ force: true }).catch(() => {});
+      }
+      await sleep(1200);
       return true;
     }
   }
@@ -1137,13 +1187,168 @@ async function clickSendInvitation(page) {
     const loc = btn.first();
     if (await loc.isVisible({ timeout: 2500 }).catch(() => false)) {
       if (await loc.isEnabled().catch(() => false)) {
-        await loc.click();
+        try {
+          await loc.click();
+        } catch {
+          await loc.click({ force: true }).catch(() => {});
+        }
         await sleep(2000);
         return true;
       }
     }
   }
+  const clickedViaEval = await page
+    .evaluate(() => {
+      const controls = Array.from(document.querySelectorAll("button, [role='button']"));
+      const sendBtn = controls.find((el) => {
+        const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+        const label = (el.getAttribute("aria-label") || "").trim().toLowerCase();
+        return (
+          text === "send" ||
+          text === "gửi" ||
+          text.includes("send invitation") ||
+          text.includes("gửi lời mời") ||
+          label.includes("send invitation") ||
+          label.includes("gửi lời mời")
+        );
+      });
+      if (!sendBtn || sendBtn.disabled) return false;
+      sendBtn.click();
+      return true;
+    })
+    .catch(() => false);
+  if (clickedViaEval) {
+    await sleep(2000);
+    return true;
+  }
   return false;
+}
+
+async function linkedinSendConnectVoyagerFromInvitePage(page, note) {
+  const requestContext = await page.evaluate((rawNote) => {
+    const getCsrf = () => {
+      const m = document.cookie.match(/JSESSIONID[=:]"?([^";,\s]+)"?/);
+      return m ? m[1] : null;
+    };
+    const getMeta = (name) => document.querySelector(`meta[name="${name}"]`)?.content || null;
+    const html = document.documentElement.innerHTML;
+    const vanityName = new URL(location.href).searchParams.get("vanityName");
+    const viewerProfileUrn =
+      html.match(
+        /com\.linkedin\.voyager\.common\.Me[\s\S]{0,500}?dashEntityUrn":"(urn:li:fsd_profile:[A-Za-z0-9_-]+)"/,
+      )?.[1] || null;
+
+    const escapedVanity = vanityName ? vanityName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : null;
+    const patterns = escapedVanity
+      ? [
+          new RegExp(
+            `entityUrn":"(urn:li:fsd_profile:[A-Za-z0-9_-]+)"[^]{0,600}?publicIdentifier":"${escapedVanity}"`,
+          ),
+          new RegExp(
+            `publicIdentifier":"${escapedVanity}"[^]{0,600}?entityUrn":"(urn:li:fsd_profile:[A-Za-z0-9_-]+)"`,
+          ),
+          new RegExp(
+            `dashEntityUrn":"(urn:li:fsd_profile:[A-Za-z0-9_-]+)"[^]{0,600}?publicIdentifier":"${escapedVanity}"`,
+          ),
+          new RegExp(
+            `publicIdentifier":"${escapedVanity}"[^]{0,600}?dashEntityUrn":"(urn:li:fsd_profile:[A-Za-z0-9_-]+)"`,
+          ),
+        ]
+      : [];
+    let inviteeProfileUrn = null;
+    for (const pattern of patterns) {
+      const match = html.match(pattern);
+      if (match?.[1]) {
+        inviteeProfileUrn = match[1];
+        break;
+      }
+    }
+    if (!inviteeProfileUrn) {
+      const fsdProfiles = [
+        ...new Set([...html.matchAll(/urn:li:fsd_profile:[A-Za-z0-9_-]+/g)].map((m) => m[0])),
+      ];
+      inviteeProfileUrn =
+        fsdProfiles.find((value) => value !== viewerProfileUrn) || fsdProfiles[0] || null;
+    }
+
+    const pageInstances = [
+      ...new Set([...html.matchAll(/urn:li:page:[^"'\\<\s]+/g)].map((m) => m[0])),
+    ];
+    const pageInstance =
+      pageInstances.find((value) => value.includes("preload.custom-invite")) ||
+      pageInstances.find((value) => value.includes("invite-connect")) ||
+      getMeta("bprPageInstance");
+
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const tzOffset = -new Date().getTimezoneOffset() / 60;
+    const serviceVersion = getMeta("serviceVersion");
+    const clientVersion =
+      serviceVersion ||
+      window.__APP_VERSION__ ||
+      document.querySelector("meta[name='version']")?.content ||
+      "1.13.44284";
+    const liTrack = {
+      clientVersion,
+      mpVersion: clientVersion,
+      osName: "web",
+      timezoneOffset: tzOffset,
+      timezone: tz,
+      deviceFormFactor: "DESKTOP",
+      mpName: "voyager-web",
+      displayDensity: window.devicePixelRatio || 1,
+      displayWidth: window.screen.width,
+      displayHeight: window.screen.height,
+    };
+
+    return {
+      csrfToken: getCsrf(),
+      language: getMeta("i18nLocale") || navigator.language || "en_US",
+      pageInstance,
+      inviteeProfileUrn,
+      liTrack,
+      customMessage: String(rawNote || "")
+        .trim()
+        .slice(0, 300),
+    };
+  }, note);
+
+  const request = buildLinkedInConnectRequest({
+    inviteeProfileUrn: requestContext.inviteeProfileUrn,
+    customMessage: requestContext.customMessage,
+    csrfToken: requestContext.csrfToken,
+    language: requestContext.language,
+    pageInstance: requestContext.pageInstance,
+    liTrack: requestContext.liTrack,
+  });
+
+  return page.evaluate(async (req) => {
+    try {
+      const resp = await fetch(req.url, {
+        method: "POST",
+        credentials: "include",
+        headers: req.headers,
+        body: req.body,
+      });
+      const text = await resp.text().catch(() => "");
+      if (!resp.ok) {
+        return { success: false, error: `HTTP ${resp.status}: ${text.slice(0, 300)}` };
+      }
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = null;
+      }
+      return {
+        success: true,
+        _method: "voyager_connect",
+        responsePreview: text.slice(0, 300),
+        data,
+      };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }, request);
 }
 
 async function linkedinSendConnect(url, note, cdpUrl) {
@@ -1194,6 +1399,21 @@ async function linkedinSendConnect(url, note, cdpUrl) {
       return { success: false, error: "Không thấy nút Kết nối trên profile." };
     }
     await sleep(1500);
+
+    if (page.url().includes("/preload/custom-invite/") || page.url().includes("/invite-connect/")) {
+      const voyagerResult = await linkedinSendConnectVoyagerFromInvitePage(page, note);
+      if (voyagerResult.success) {
+        return {
+          success: true,
+          recipient: profileUrl,
+          note_preview: (note || "").trim().slice(0, 80),
+          connectionStatus: "PENDING",
+          note: "Đã gửi lời mời kết nối qua LinkedIn Voyager API.",
+          _method: voyagerResult._method,
+        };
+      }
+      console.error(`[sendConnectVoyager] fallback UI sau khi API fail: ${voyagerResult.error}`);
+    }
 
     if (note?.trim()) {
       const filled = await fillConnectNoteModal(page, note);
