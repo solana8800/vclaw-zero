@@ -914,6 +914,22 @@ async function linkedinGetProfile(url, cdpUrl) {
         recommendations = extractedProfile.recommendations ?? [];
 
         try {
+          // Đầu tiên tìm badge hiển thị mức độ kết nối (1st, 2nd, 3rd) nằm ngay cạnh tên ứng viên
+          let distanceText = "";
+          try {
+            const distBadge = page
+              .locator(
+                ".dist-value, .distance-badge, span[class*='dist-value'], span[class*='distance-badge']",
+              )
+              .first();
+            distanceText = (await distBadge.innerText().catch(() => "")).trim();
+          } catch (e) {
+            /* bỏ qua nếu không đọc được badge */
+          }
+
+          const isFirstDegree = /1st|Cấp 1/i.test(distanceText);
+          const isOtherDegree = /2nd|3rd|Cấp 2|Cấp 3/i.test(distanceText);
+
           const connectBtn = profileAction(page, linkedInConnectButtonName)
             .or(connectActionFallback(page))
             .first();
@@ -921,12 +937,31 @@ async function linkedinGetProfile(url, cdpUrl) {
           const messageBtn = profileAction(page, linkedInMessageButtonName)
             .or(messageActionFallback(page))
             .first();
-          if (await messageBtn.isVisible().catch(() => false)) {
+
+          const hasConnect = await connectBtn.isVisible().catch(() => false);
+          const hasPending = await pendingBtn.isVisible().catch(() => false);
+          const hasMessage = await messageBtn.isVisible().catch(() => false);
+
+          // Phân loại trạng thái kết nối cực kỳ chuẩn xác để không bị nhầm lẫn
+          if (isFirstDegree) {
             connectionStatus = "CONNECTED";
-          } else if (await pendingBtn.isVisible().catch(() => false)) {
-            connectionStatus = "PENDING";
-          } else if (await connectBtn.isVisible().catch(() => false)) {
-            connectionStatus = "NOT_CONNECTED";
+          } else if (isOtherDegree) {
+            if (hasPending) {
+              connectionStatus = "PENDING";
+            } else {
+              connectionStatus = "NOT_CONNECTED";
+            }
+          } else {
+            // Nếu không tìm thấy badge khoảng cách thì dùng logic kiểm tra các nút bấm dự phòng
+            if (hasConnect) {
+              connectionStatus = "NOT_CONNECTED";
+            } else if (hasPending) {
+              connectionStatus = "PENDING";
+            } else if (hasMessage) {
+              connectionStatus = "CONNECTED";
+            } else {
+              connectionStatus = "UNKNOWN";
+            }
           }
         } catch {
           /* bỏ qua */
@@ -1398,8 +1433,57 @@ async function linkedinSendConnect(url, note, cdpUrl) {
       return { success: false, error: "Chưa đăng nhập LinkedIn trên Chrome CDP." };
     }
 
+    // Đầu tiên tìm badge hiển thị mức độ kết nối (1st, 2nd, 3rd) để xác định chính xác
+    let distanceText = "";
+    try {
+      const distBadge = page
+        .locator(
+          ".dist-value, .distance-badge, span[class*='dist-value'], span[class*='distance-badge']",
+        )
+        .first();
+      distanceText = (await distBadge.innerText().catch(() => "")).trim();
+    } catch (e) {
+      /* bỏ qua nếu không đọc được badge */
+    }
+
+    const isFirstDegree = /1st|Cấp 1/i.test(distanceText);
+    const isOtherDegree = /2nd|3rd|Cấp 2|Cấp 3/i.test(distanceText);
+
+    const connectBtn = profileAction(page, linkedInConnectButtonName)
+      .or(connectActionFallback(page))
+      .first();
     const pendingBtn = page.getByRole("button", { name: linkedInPendingButtonName }).first();
-    if (await pendingBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+    const messageBtn = page
+      .getByRole("button", { name: linkedInMessageButtonName })
+      .or(page.getByRole("link", { name: linkedInMessageButtonName }))
+      .or(messageActionFallback(page))
+      .first();
+
+    const hasConnect = await connectBtn.isVisible({ timeout: 3000 }).catch(() => false);
+    const hasPending = await pendingBtn.isVisible({ timeout: 3000 }).catch(() => false);
+    const hasMessage = await messageBtn.isVisible({ timeout: 3000 }).catch(() => false);
+
+    let isRealConnected = false;
+    let isRealPending = false;
+
+    if (isFirstDegree) {
+      isRealConnected = true;
+    } else if (isOtherDegree) {
+      if (hasPending) {
+        isRealPending = true;
+      }
+    } else {
+      // Trường hợp fallback nếu không tìm thấy badge khoảng cách quan hệ
+      if (hasConnect) {
+        isRealConnected = false;
+      } else if (hasPending) {
+        isRealPending = true;
+      } else if (hasMessage) {
+        isRealConnected = true;
+      }
+    }
+
+    if (isRealPending) {
       return {
         success: false,
         error: "Đã gửi lời mời kết nối trước đó — đang chờ ứng viên chấp nhận.",
@@ -1407,12 +1491,7 @@ async function linkedinSendConnect(url, note, cdpUrl) {
       };
     }
 
-    const messageBtn = page
-      .getByRole("button", { name: linkedInMessageButtonName })
-      .or(page.getByRole("link", { name: linkedInMessageButtonName }))
-      .or(messageActionFallback(page))
-      .first();
-    if (await messageBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+    if (isRealConnected) {
       return {
         success: false,
         error: "Đã kết nối với ứng viên — dùng Gửi tin nhắn thay vì kết bạn.",
