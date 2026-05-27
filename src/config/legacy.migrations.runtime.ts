@@ -1,3 +1,4 @@
+import { isLoopbackIpAddress } from "../shared/net/ip.js";
 import {
   buildDefaultControlUiAllowedOrigins,
   hasConfiguredControlUiAllowedOrigins,
@@ -215,6 +216,11 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME: LegacyConfigMigrationSpec[] = [
       if (!isGatewayNonLoopbackBindMode(bind)) {
         return;
       }
+      const customBindHost =
+        typeof gateway.customBindHost === "string" ? gateway.customBindHost.trim() : undefined;
+      if (bind === "custom" && customBindHost && isLoopbackIpAddress(customBindHost)) {
+        return;
+      }
       const controlUi = getRecord(gateway.controlUi) ?? {};
       if (
         hasConfiguredControlUiAllowedOrigins({
@@ -229,8 +235,7 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME: LegacyConfigMigrationSpec[] = [
       const origins = buildDefaultControlUiAllowedOrigins({
         port,
         bind,
-        customBindHost:
-          typeof gateway.customBindHost === "string" ? gateway.customBindHost : undefined,
+        customBindHost,
       });
       gateway.controlUi = { ...controlUi, allowedOrigins: origins };
       raw.gateway = gateway;
