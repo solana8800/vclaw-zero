@@ -75,6 +75,7 @@ if (
     const child = spawn(process.execPath, plan.argv, {
       stdio: "inherit",
       env: plan.env,
+      windowsHide: true,
     });
 
     attachChildProcessBridge(child);
